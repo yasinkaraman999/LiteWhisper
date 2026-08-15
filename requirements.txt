@@ -1,0 +1,9 @@
+rumps
+pynput
+sounddevice
+numpy
+requests
+pyobjc-framework-AVFoundation
+faster-whisper
+noisereduce
+scipy

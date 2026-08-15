@@ -1,0 +1,23 @@
+# Python
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# py2app build output (the .app bundle and the .dmg are hundreds of MB)
+build/
+dist/
+
+# Local logs and scratch output
+*.log
+
+# macOS
+.DS_Store
+
+# Never commit anything that could carry an API key or recorded audio.
+# The app keeps all of it in ~/.config/lite-whisper/, outside this repo, but
+# these patterns guard against a stray copy landing here.
+config.json
+*.db
+*.wav
+*.aiff
