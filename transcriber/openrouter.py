@@ -1,4 +1,5 @@
 import base64
+import unicodedata
 
 import requests
 
@@ -37,4 +38,9 @@ class OpenRouterTranscriber(Transcriber):
         if "text" not in body:
             raise RuntimeError(f"Unexpected OpenRouter response: {body}")
         self.last_usage = body.get("usage")
-        return body["text"]
+        # Normalized to a single canonical form (precomposed) so repeated
+        # transcriptions of the same audio — as live dictation does — are
+        # never one decomposed-vs-composed accent apart, which would
+        # otherwise show up as bogus diffs around Turkish and other
+        # diacritic letters.
+        return unicodedata.normalize("NFC", body["text"])

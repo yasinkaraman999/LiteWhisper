@@ -765,21 +765,43 @@ def _on_mic_clicked():
     if not mic_lock.acquire(MIC_OWNER):
         rumps.notification("lite-whisper", "", "Microphone is busy")
         return
+
+    # Opening the audio stream is slow enough to noticeably freeze the app
+    # if done on the main thread — hotkey.py's on_toggle() dispatches for
+    # exactly this reason, and this button needs the same treatment.
     _recorder = AudioRecorder()
-    _recorder.start()
+    recorder = _recorder
     _recording = True
     _mic_button.setContentTintColor_(NSColor.systemRedColor())
+
+    def start_stream():
+        try:
+            recorder.start()
+        except Exception as e:
+            def on_error():
+                global _recording
+                _recording = False
+                _mic_button.setContentTintColor_(None)
+                mic_lock.release(MIC_OWNER)
+                rumps.notification("lite-whisper", "Chat", f"Couldn't start recording: {e}")
+
+            AppHelper.callAfter(on_error)
+
+    threading.Thread(target=start_stream, daemon=True).start()
 
 
 def _stop_chat_recording():
     global _recording
     recorder = _recorder
-    wav_bytes = recorder.stop()
     _recording = False
     _mic_button.setContentTintColor_(None)
     mic_lock.release(MIC_OWNER)
 
     def transcribe():
+        # Stopping the stream (and the noise-cleanup pass on the captured
+        # audio) is the same kind of slow, main-thread-unsafe work as
+        # starting it — see the comment in _on_mic_clicked().
+        wav_bytes = recorder.stop()
         try:
             if not wav_bytes or not recorder.last_had_speech:
                 return

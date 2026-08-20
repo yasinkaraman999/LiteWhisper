@@ -89,9 +89,10 @@ class AudioRecorder:
     def stop(self):
         self._recording = False
         self._level = 0.0
-        self._stream.stop()
-        self._stream.close()
-        self._stream = None
+        if self._stream is not None:
+            self._stream.stop()
+            self._stream.close()
+            self._stream = None
 
         if not self._frames:
             self.last_had_speech = False

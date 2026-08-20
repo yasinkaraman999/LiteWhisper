@@ -2,6 +2,7 @@ import os
 import shutil
 import tempfile
 import threading
+import unicodedata
 from pathlib import Path
 
 from . import Transcriber
@@ -162,4 +163,7 @@ class LocalWhisperTranscriber(Transcriber):
             tmp.write(wav_bytes)
             tmp.flush()
             segments, _info = model.transcribe(tmp.name)
-            return "".join(segment.text for segment in segments).strip()
+            text = "".join(segment.text for segment in segments).strip()
+            # See openrouter.py's transcribe() for why this is normalized
+            # to a single canonical form here.
+            return unicodedata.normalize("NFC", text)
