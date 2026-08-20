@@ -77,6 +77,7 @@ _hint_label = None
 _title_label = None
 _state = "idle"
 _stop_callback = None
+_live_stop_callback = None
 _style = STYLE_CLASSIC
 
 
@@ -222,7 +223,7 @@ class MeterView(NSView):
         self._phase = 0.0
 
     def tick_(self, timer):
-        if _state == "recording":
+        if _state in ("recording", "live"):
             level = self._level_source() if self._level_source else 0.0
             self._levels.append(level)
         elif _state == "processing":
@@ -231,7 +232,7 @@ class MeterView(NSView):
 
     def drawRect_(self, rect):
         bounds = self.bounds()
-        if _state == "recording":
+        if _state in ("recording", "live"):
             self._draw_waveform(bounds)
         elif _state == "processing":
             self._draw_swell(bounds)
@@ -450,17 +451,19 @@ def _glass_view(frame):
 
 
 def _on_stop_clicked():
-    if _stop_callback is not None:
-        _stop_callback()
+    callback = _live_stop_callback if _state == "live" else _stop_callback
+    if callback is not None:
+        callback()
 
 
 # ------------------------------------------------------------------- API
 
 
-def configure(stop_callback, level_source):
+def configure(stop_callback, level_source, live_stop_callback=None):
     """Wire the overlay to the app. Called once at startup."""
-    global _stop_callback
+    global _stop_callback, _live_stop_callback
     _stop_callback = stop_callback
+    _live_stop_callback = live_stop_callback
     _rebuild_if_needed(level_source)
 
 
@@ -519,21 +522,25 @@ def set_state(state):
     if _panel is None:
         return
 
-    if state == "recording" and _meter is not None:
+    if state in ("recording", "live") and _meter is not None:
         _meter.reset()
 
     if _title_label is not None:
         _title_label.setStringValue_(
-            {"recording": "Recording", "processing": "Transcribing..."}.get(
-                state, "Ready"
-            )
+            {
+                "recording": "Recording",
+                "live": "Live",
+                "processing": "Transcribing...",
+            }.get(state, "Ready")
         )
     if _hint_label is not None:
-        _hint_label.setStringValue_(
-            "\u2325Space to stop \u00b7 esc to cancel"
-            if state == "recording"
-            else "\u2325Space to start"
-        )
+        if state == "live":
+            hint = "\u21e7\u2325Space to stop \u00b7 esc to cancel"
+        elif state == "recording":
+            hint = "\u2325Space to stop \u00b7 esc to cancel"
+        else:
+            hint = "\u2325Space to start \u00b7 \u21e7\u2325Space for live"
+        _hint_label.setStringValue_(hint)
 
     if state == "idle" and not cfg["recording_window_always_show"]:
         _set_animating(False)
@@ -541,7 +548,7 @@ def set_state(state):
     else:
         _move_to_dock(cfg["recording_window_dock"])
         _panel.orderFrontRegardless()
-        _set_animating(state in ("recording", "processing"))
+        _set_animating(state in ("recording", "live", "processing"))
         if _meter is not None:
             _meter.setNeedsDisplay_(True)
 

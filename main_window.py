@@ -69,6 +69,8 @@ NAV_ITEMS = [
      settings_window.build_sound_page, settings_window.refresh_all),
     ("overlay", "Recording Window", "waveform", NSColor.systemTealColor(),
      settings_window.build_overlay_page, settings_window.refresh_all),
+    ("live", "Live Transcript", "bolt.fill", NSColor.systemYellowColor(),
+     settings_window.build_live_page, settings_window.refresh_all),
     ("models", "Model Library", "books.vertical.fill", NSColor.systemOrangeColor(),
      settings_window.build_models_page, settings_window.refresh_all),
     ("history", "History", "clock.arrow.circlepath", NSColor.systemPurpleColor(),

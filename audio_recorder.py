@@ -1,5 +1,3 @@
-import io
-import wave
 from datetime import datetime
 
 import numpy as np
@@ -8,17 +6,15 @@ import sounddevice as sd
 import audio_cleanup
 import config
 import voice_activity
+import wav_io
 
 SAMPLE_RATE = 16000
 CHANNELS = 1
 
 
 def _write_wav(path, audio):
-    with wave.open(str(path), "wb") as wf:
-        wf.setnchannels(CHANNELS)
-        wf.setsampwidth(2)  # int16
-        wf.setframerate(SAMPLE_RATE)
-        wf.writeframes(audio.tobytes())
+    with open(path, "wb") as f:
+        f.write(wav_io.encode_wav(audio, SAMPLE_RATE, CHANNELS))
 
 
 def _save_debug_pair(raw, cleaned):
@@ -115,10 +111,4 @@ class AudioRecorder:
         if cfg["debug_save_audio"]:
             _save_debug_pair(raw, cleaned)
 
-        buf = io.BytesIO()
-        with wave.open(buf, "wb") as wf:
-            wf.setnchannels(CHANNELS)
-            wf.setsampwidth(2)  # int16
-            wf.setframerate(SAMPLE_RATE)
-            wf.writeframes(cleaned.tobytes())
-        return buf.getvalue()
+        return wav_io.encode_wav(cleaned, SAMPLE_RATE, CHANNELS)

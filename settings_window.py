@@ -59,6 +59,11 @@ _overlay_style_popup = None
 _overlay_always_checkbox = None
 _dock_edge_popup = None
 _dock_slot_popup = None
+_live_engine_popup = None
+_live_model_popup = None
+_live_status_label = None
+_live_available_models = []  # [{"id": ..., "name": ...}]
+_live_local_popup = None
 
 
 def _list_input_devices():
@@ -225,6 +230,52 @@ def build_overlay_page():
     ])
 
 
+def build_live_page():
+    global _live_engine_popup, _live_model_popup, _live_status_label, _live_local_popup
+
+    _live_engine_popup = _popup()
+    for _, label_text in ENGINE_OPTIONS:
+        _live_engine_popup.addItemWithTitle_(label_text)
+
+    _live_model_popup = _popup()
+
+    _live_status_label = nsui.secondary("", size=11.0)
+    _live_status_label.setAlignment_(NSTextAlignmentRight)
+    nsui.activate([_live_status_label.widthAnchor().constraintEqualToConstant_(150.0)])
+
+    _live_local_popup = _popup()
+    for size in config.LOCAL_MODEL_SIZES:
+        _live_local_popup.addItemWithTitle_(size)
+
+    engine_section = nsui.section("Engine", [
+        nsui.row("Live engine", _live_engine_popup),
+    ], footer="Shift + Option + Space types what you say as you speak, "
+              "independently of the engine and model used for regular "
+              "dictation.")
+
+    cloud_section = nsui.section("OpenRouter", [
+        nsui.row("Cloud model", _live_model_popup),
+        nsui.row("Model list", nsui.hstack_control([
+            _live_status_label,
+            nsui.button("Refresh", _on_refresh_live_models),
+        ])),
+    ], footer="Uses the same API key as regular cloud dictation. Live mode "
+              "re-transcribes every second or so, so a fast, cheap model "
+              "usually works better here than your most accurate one.")
+
+    local_section = nsui.section("Local", [
+        nsui.row("Local model", _live_local_popup),
+    ], footer="Smaller models respond faster, which matters more for live "
+              "typing than for a one-shot dictation.")
+
+    return nsui.scroll_page([
+        engine_section,
+        cloud_section,
+        local_section,
+        _save_footer(),
+    ])
+
+
 def build_models_page():
     global _active_local_popup
 
@@ -279,14 +330,14 @@ def _slider_target():
     return target
 
 
-def _populate_model_popup(models_list, selected_id):
-    _model_popup.removeAllItems()
+def _populate_model_popup(popup, models_list, selected_id):
+    popup.removeAllItems()
     for m in models_list:
-        _model_popup.addItemWithTitle_(f"{m['name']}  —  {m['id']}")
+        popup.addItemWithTitle_(f"{m['name']}  —  {m['id']}")
 
     ids = [m["id"] for m in models_list]
     if selected_id in ids:
-        _model_popup.selectItemAtIndex_(ids.index(selected_id))
+        popup.selectItemAtIndex_(ids.index(selected_id))
 
 
 def _on_refresh_models():
@@ -308,8 +359,35 @@ def _on_refresh_models():
             global _available_models
             _available_models = fetched
             cfg = config.load()
-            _populate_model_popup(fetched, cfg["model"])
+            _populate_model_popup(_model_popup, fetched, cfg["model"])
             _status_label.setStringValue_(f"{len(fetched)} models")
+
+        AppHelper.callAfter(apply)
+
+    threading.Thread(target=fetch, daemon=True).start()
+
+
+def _on_refresh_live_models():
+    api_key = config.load()["openrouter_api_key"]
+    if not api_key:
+        _live_status_label.setStringValue_("Enter an API key in Configuration first")
+        return
+
+    _live_status_label.setStringValue_("Loading...")
+
+    def fetch():
+        try:
+            fetched = models.fetch_cloud_models(api_key)
+        except Exception as e:
+            AppHelper.callAfter(_live_status_label.setStringValue_, f"Error: {e}")
+            return
+
+        def apply():
+            global _live_available_models
+            _live_available_models = fetched
+            cfg = config.load()
+            _populate_model_popup(_live_model_popup, fetched, cfg["live_model"])
+            _live_status_label.setStringValue_(f"{len(fetched)} models")
 
         AppHelper.callAfter(apply)
 
@@ -391,6 +469,19 @@ def _on_save():
     if _active_local_popup is not None:
         cfg["local_model_size"] = _selected_active_local_size()
 
+    if _live_engine_popup is not None:
+        live_engine_index = _live_engine_popup.indexOfSelectedItem()
+        if 0 <= live_engine_index < len(ENGINE_OPTIONS):
+            cfg["live_engine"] = ENGINE_OPTIONS[live_engine_index][0]
+
+        selected_index = _live_model_popup.indexOfSelectedItem()
+        if 0 <= selected_index < len(_live_available_models):
+            cfg["live_model"] = _live_available_models[selected_index]["id"]
+
+        local_index = _live_local_popup.indexOfSelectedItem()
+        if 0 <= local_index < len(config.LOCAL_MODEL_SIZES):
+            cfg["live_local_model_size"] = config.LOCAL_MODEL_SIZES[local_index]
+
     if _input_device_popup is not None:
         device_index = _input_device_popup.indexOfSelectedItem()
         if 0 <= device_index < len(_input_device_ids):
@@ -429,7 +520,7 @@ def refresh_all():
 
     if _api_key_field is not None:
         _api_key_field.setStringValue_(cfg["openrouter_api_key"])
-        _populate_model_popup(_available_models, cfg["model"])
+        _populate_model_popup(_model_popup, _available_models, cfg["model"])
         if not _available_models:
             _model_popup.removeAllItems()
             _model_popup.addItemWithTitle_(cfg["model"])
@@ -445,6 +536,23 @@ def refresh_all():
                 config.LOCAL_MODEL_SIZES.index(cfg["local_model_size"])
             )
         _refresh_local_rows()
+
+    if _live_engine_popup is not None:
+        engine_ids = [e[0] for e in ENGINE_OPTIONS]
+        if cfg["live_engine"] in engine_ids:
+            _live_engine_popup.selectItemAtIndex_(engine_ids.index(cfg["live_engine"]))
+
+        _populate_model_popup(_live_model_popup, _live_available_models, cfg["live_model"])
+        if not _live_available_models:
+            _live_model_popup.removeAllItems()
+            if cfg["live_model"]:
+                _live_model_popup.addItemWithTitle_(cfg["live_model"])
+        _live_status_label.setStringValue_("")
+
+        if cfg["live_local_model_size"] in config.LOCAL_MODEL_SIZES:
+            _live_local_popup.selectItemAtIndex_(
+                config.LOCAL_MODEL_SIZES.index(cfg["live_local_model_size"])
+            )
 
     if _input_device_popup is not None:
         if cfg["input_device"] in _input_device_ids:

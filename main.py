@@ -6,13 +6,17 @@ from PyObjCTools import AppHelper
 import config
 import history
 import hotkey
+import live_transcribe
 import main_window
+import mic_lock
 import output
 import recording_window
 import sounds
 from audio_recorder import AudioRecorder
 from resources import resource_path
 from transcriber import get_transcriber
+
+MIC_OWNER = "dictation"
 
 STATE_IDLE = ""
 STATE_RECORDING = " 🔴"
@@ -37,15 +41,18 @@ class LiteWhisperApp(rumps.App):
             "Quit",
         ]
         self.recorder = AudioRecorder()
+        self.live_dictation = live_transcribe.LiveDictation()
         recording_window.configure(
             stop_callback=self.on_toggle,
             level_source=lambda: self.recorder.level,
+            live_stop_callback=self.on_live_toggle,
         )
         self._overlay_state("idle")
         self._listener = hotkey.start_listener(
             self.on_toggle,
+            on_live_toggle=self.on_live_toggle,
             on_cancel=self.on_cancel,
-            is_recording=lambda: self.recorder.is_recording,
+            is_active=lambda: self.recorder.is_recording or self.live_dictation.is_active,
         )
 
     @rumps.clicked("Open LiteWhisper")
@@ -90,19 +97,46 @@ class LiteWhisperApp(rumps.App):
             self.record_item.title = "Start Recording"
             self._overlay_state("processing")
             wav_bytes = self.recorder.stop()
+            mic_lock.release(MIC_OWNER)
             threading.Thread(target=self._transcribe, args=(wav_bytes,), daemon=True).start()
         else:
+            if self.live_dictation.is_active:
+                rumps.notification("lite-whisper", "", "Microphone is busy")
+                return
+            if not mic_lock.acquire(MIC_OWNER):
+                rumps.notification("lite-whisper", "", "Microphone is busy")
+                return
             sounds.play_start()
             self.title = STATE_RECORDING
             self.record_item.title = "Stop Recording"
             self.recorder.start()
             self._overlay_state("recording")
 
+    def on_live_toggle(self, sender=None):
+        if self.live_dictation.is_active:
+            self.live_dictation.stop()
+            self._overlay_state("idle")
+            return
+        if self.recorder.is_recording:
+            rumps.notification("lite-whisper", "", "Microphone is busy")
+            return
+        if not self.live_dictation.start():
+            rumps.notification("lite-whisper", "", "Microphone is busy")
+            return
+        sounds.play_start()
+        self._overlay_state("live")
+
     def on_cancel(self, sender=None):
         """Escape during a recording: drop it without transcribing."""
+        if self.live_dictation.is_active:
+            self.live_dictation.cancel()
+            sounds.play_stop()
+            self._overlay_state("idle")
+            return
         if not self.recorder.is_recording:
             return
         self.recorder.cancel()
+        mic_lock.release(MIC_OWNER)
         sounds.play_stop()
         self.title = STATE_IDLE
         self.record_item.title = "Start Recording"
@@ -118,7 +152,12 @@ class LiteWhisperApp(rumps.App):
                 return
 
             cfg = config.load()
-            transcriber = get_transcriber(cfg)
+            transcriber = get_transcriber(
+                engine=cfg["engine"],
+                model=cfg["model"],
+                local_model_size=cfg["local_model_size"],
+                api_key=cfg["openrouter_api_key"],
+            )
             text = transcriber.transcribe(wav_bytes)
 
             if text.strip():

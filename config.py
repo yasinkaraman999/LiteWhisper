@@ -22,6 +22,9 @@ DEFAULTS = {
     "debug_save_audio": False,
     "noise_reduction_strength": 0.7,  # 0.0-1.0
     "vad_enabled": True,  # skip recordings that contain no detected speech
+    "live_engine": "local",  # "cloud" or "local" — independent of the batch engine
+    "live_model": "",  # cloud model id used only for live dictation
+    "live_local_model_size": "tiny",  # local model size used only for live dictation
     "input_device": None,  # sounddevice input device index, None = system default
     "recording_window_style": "classic",  # "classic", "mini" or "none"
     "recording_window_always_show": False,
