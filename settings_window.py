@@ -54,6 +54,7 @@ _input_device_ids = []  # index i -> sounddevice index, or None for system defau
 _noise_slider = None
 _noise_value_label = None
 _debug_audio_checkbox = None
+_vad_checkbox = None
 _overlay_style_popup = None
 _overlay_always_checkbox = None
 _dock_edge_popup = None
@@ -130,7 +131,7 @@ def build_configuration_page():
 
 def build_sound_page():
     global _input_device_popup, _input_device_ids
-    global _noise_slider, _noise_value_label, _debug_audio_checkbox
+    global _noise_slider, _noise_value_label, _debug_audio_checkbox, _vad_checkbox
 
     _input_device_popup = _popup()
     _input_device_popup.addItemWithTitle_("System Default")
@@ -157,6 +158,7 @@ def build_sound_page():
     nsui.activate([_noise_value_label.widthAnchor().constraintEqualToConstant_(40.0)])
 
     _debug_audio_checkbox = nsui.checkbox()
+    _vad_checkbox = nsui.checkbox()
 
     return nsui.scroll_page([
         nsui.section("Input", [
@@ -166,6 +168,12 @@ def build_sound_page():
             nsui.row(
                 "Noise reduction",
                 nsui.hstack_control([_noise_slider, _noise_value_label]),
+            ),
+            nsui.row(
+                "Skip recordings with no speech",
+                _vad_checkbox,
+                subtitle="Detects whether you actually said anything before "
+                         "sending a recording off for transcription.",
             ),
         ], footer="0 is off, 1 is most aggressive. Higher values strip more "
                   "background noise but can make your voice sound less natural."),
@@ -390,6 +398,7 @@ def _on_save():
 
         cfg["noise_reduction_strength"] = round(_noise_slider.doubleValue(), 2)
         cfg["debug_save_audio"] = bool(_debug_audio_checkbox.state())
+        cfg["vad_enabled"] = bool(_vad_checkbox.state())
 
     if _overlay_style_popup is not None:
         style_index = _overlay_style_popup.indexOfSelectedItem()
@@ -448,6 +457,7 @@ def refresh_all():
         _noise_slider.setDoubleValue_(cfg["noise_reduction_strength"])
         _update_noise_label()
         _debug_audio_checkbox.setState_(1 if cfg["debug_save_audio"] else 0)
+        _vad_checkbox.setState_(1 if cfg["vad_enabled"] else 0)
 
     if _overlay_style_popup is not None:
         style_ids = [s[0] for s in OVERLAY_STYLE_OPTIONS]

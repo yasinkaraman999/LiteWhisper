@@ -43,6 +43,7 @@ OPTIONS = {
         "tqdm",
         "noisereduce",
         "scipy",
+        "webrtcvad",
     ],
     # PIL is pulled in transitively (unused by us) and ships a liblzma.dylib
     # that fails codesign's strict validation — excluding it avoids that

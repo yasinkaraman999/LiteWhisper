@@ -113,6 +113,10 @@ class LiteWhisperApp(rumps.App):
             if not wav_bytes:
                 raise ValueError("Recording is empty")
 
+            if not self.recorder.last_had_speech:
+                rumps.notification("lite-whisper", "", "No speech detected")
+                return
+
             cfg = config.load()
             transcriber = get_transcriber(cfg)
             text = transcriber.transcribe(wav_bytes)

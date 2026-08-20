@@ -1,9 +1,10 @@
 import numpy as np
 from scipy.signal import butter, filtfilt
 
-FRAME_MS = 30
+import voice_activity
+
+FRAME_MS = voice_activity.FRAME_MS
 PADDING_MS = 150
-SILENCE_RMS_RATIO = 0.08  # fraction of peak RMS below which a frame is "silence"
 HIGH_PASS_HZ = 80
 
 
@@ -38,16 +39,13 @@ def _trim_silence(audio, sample_rate):
         return audio
 
     n_frames = len(audio) // frame_len
-    frames = audio[: n_frames * frame_len].reshape(n_frames, frame_len)
-    rms = np.sqrt(np.mean(frames**2, axis=1))
-
-    peak_rms = rms.max()
-    if peak_rms == 0:
+    pcm = _to_int16(audio[: n_frames * frame_len])
+    flags = voice_activity.frame_voiced_flags(pcm, sample_rate)
+    if not flags:
         return audio
 
-    threshold = peak_rms * SILENCE_RMS_RATIO
-    loud = np.where(rms > threshold)[0]
-    if len(loud) == 0:
+    loud = [i for i, voiced in enumerate(flags) if voiced]
+    if not loud:
         return audio
 
     padding_frames = max(1, int(PADDING_MS / FRAME_MS))

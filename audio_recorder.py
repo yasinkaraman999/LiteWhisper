@@ -7,6 +7,7 @@ import sounddevice as sd
 
 import audio_cleanup
 import config
+import voice_activity
 
 SAMPLE_RATE = 16000
 CHANNELS = 1
@@ -36,6 +37,11 @@ class AudioRecorder:
         self._stream = None
         self._recording = False
         self._level = 0.0
+        # Whether the most recently stopped recording contained actual
+        # speech, per voice_activity.has_speech(). Callers check this before
+        # sending audio off to a transcriber, so a recording that captured
+        # nothing but silence never costs an API call.
+        self.last_had_speech = True
 
     @property
     def is_recording(self):
@@ -92,10 +98,16 @@ class AudioRecorder:
         self._stream = None
 
         if not self._frames:
+            self.last_had_speech = False
             return None
 
         cfg = config.load()
         raw = np.concatenate(self._frames, axis=0).flatten()
+
+        self.last_had_speech = (
+            voice_activity.has_speech(raw, SAMPLE_RATE) if cfg["vad_enabled"] else True
+        )
+
         cleaned = audio_cleanup.clean(
             raw, SAMPLE_RATE, noise_reduction_strength=cfg["noise_reduction_strength"]
         )
