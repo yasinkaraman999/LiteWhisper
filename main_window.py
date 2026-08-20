@@ -45,12 +45,13 @@ from AppKit import (
 )
 from Foundation import NSIndexSet, NSObject
 
+import app_activation
 import history_window
 import home_page
 import nsui
 import permissions_window
 import settings_window
-from ui_helpers import compose_badge_image, keep_alive
+from ui_helpers import WindowCloseObserver, compose_badge_image, keep_alive
 
 SIDEBAR_MIN_WIDTH = 204.0
 SIDEBAR_MAX_WIDTH = 280.0
@@ -351,6 +352,12 @@ def _build_window():
     window.setToolbar_(toolbar)
     window.setToolbarStyle_(NSWindowToolbarStyleUnified)
 
+    close_observer = WindowCloseObserver.alloc().initWithCallback_(
+        lambda: app_activation.note_window_closed("main")
+    )
+    keep_alive(close_observer)
+    window.setDelegate_(close_observer)
+
     return window
 
 
@@ -386,3 +393,4 @@ def show(page="home"):
     show_page(page)
     _window.makeKeyAndOrderFront_(None)
     NSApp.activateIgnoringOtherApps_(True)
+    app_activation.note_window_shown("main")

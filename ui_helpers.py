@@ -23,6 +23,25 @@ def keep_alive(target):
     _handlers.append(target)
 
 
+class WindowCloseObserver(NSObject):
+    """A minimal NSWindowDelegate that only cares about windowWillClose:.
+
+    Shared by any window that wants a callback when it closes — e.g. to
+    drop out of app_activation's open-window set — without every such
+    window needing its own delegate class.
+    """
+
+    def initWithCallback_(self, callback):
+        self = objc.super(WindowCloseObserver, self).init()
+        if self is None:
+            return None
+        self._callback = callback
+        return self
+
+    def windowWillClose_(self, notification):
+        self._callback()
+
+
 BADGE_TILE_WHITE = 0.94
 BADGE_TILE_ALPHA = 0.92
 

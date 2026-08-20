@@ -48,6 +48,7 @@ _model_popup = None
 _status_label = None
 _available_models = []  # [{"id": ..., "name": ...}]
 _engine_popup = None
+_cloud_section_view = None
 _active_local_popup = None
 _local_rows = {}  # size -> {"status": label, "button": button}
 _input_device_popup = None
@@ -65,10 +66,19 @@ _live_model_popup = None
 _live_status_label = None
 _live_available_models = []  # [{"id": ..., "name": ...}]
 _live_local_popup = None
+_live_cloud_section_view = None
+_live_local_section_view = None
 _chat_model_popup = None
 _chat_status_label = None
 _chat_available_models = []  # [{"id": ..., "name": ..., "supports_images": ...}]
 _chat_bubble_checkbox = None
+
+# The Configuration page's cloud model list auto-fetches once, the first
+# time the page is shown, so a manual "Refresh" click is only needed for
+# later re-fetches. (Live Transcript and Chat trigger their own first fetch
+# directly at the end of their build_*_page() — see there for why
+# Configuration can't do the same.)
+_config_auto_refreshed = False
 
 
 def _list_input_devices():
@@ -88,6 +98,14 @@ def _popup():
     return popup
 
 
+def _wire_popup(popup, callback):
+    """Runs `callback()` whenever the user changes `popup`'s selection."""
+    target = ButtonTarget.alloc().initWithCallback_(lambda _sender: callback())
+    keep_alive(target)
+    popup.setTarget_(target)
+    popup.setAction_("clicked:")
+
+
 def _secure_text_field(placeholder):
     field = nsui.anchor(NSTextField.alloc().init())
     field.setPlaceholderString_(placeholder)
@@ -104,13 +122,14 @@ def _secure_text_field(placeholder):
 
 
 def build_configuration_page():
-    global _api_key_field, _engine_popup, _model_popup, _status_label
+    global _api_key_field, _engine_popup, _model_popup, _status_label, _cloud_section_view
 
     _api_key_field = _secure_text_field("sk-or-v1-…")
 
     _engine_popup = _popup()
     for _, label_text in ENGINE_OPTIONS:
         _engine_popup.addItemWithTitle_(label_text)
+    _wire_popup(_engine_popup, _on_engine_changed)
 
     _model_popup = _popup()
 
@@ -123,7 +142,7 @@ def build_configuration_page():
     ], footer="The local engine works without a network connection, and no audio\n"
            "ever leaves your computer.")
 
-    cloud_section = nsui.section("OpenRouter", [
+    _cloud_section_view = nsui.section("OpenRouter", [
         nsui.row("API key", _api_key_field, stretch=True),
         nsui.row("Cloud model", _model_popup),
         nsui.row("Model list", nsui.hstack_control([
@@ -134,7 +153,7 @@ def build_configuration_page():
 
     return nsui.scroll_page([
         engine_section,
-        cloud_section,
+        _cloud_section_view,
         _save_footer(),
     ])
 
@@ -237,10 +256,12 @@ def build_overlay_page():
 
 def build_live_page():
     global _live_engine_popup, _live_model_popup, _live_status_label, _live_local_popup
+    global _live_cloud_section_view, _live_local_section_view
 
     _live_engine_popup = _popup()
     for _, label_text in ENGINE_OPTIONS:
         _live_engine_popup.addItemWithTitle_(label_text)
+    _wire_popup(_live_engine_popup, _on_live_engine_changed)
 
     _live_model_popup = _popup()
 
@@ -248,9 +269,10 @@ def build_live_page():
     _live_status_label.setAlignment_(NSTextAlignmentRight)
     nsui.activate([_live_status_label.widthAnchor().constraintEqualToConstant_(150.0)])
 
+    # Populated by _refresh_local_rows() (via refresh_all(), which always
+    # runs right after this page is built), so items can be labelled with
+    # actual download status instead of a bare list of sizes.
     _live_local_popup = _popup()
-    for size in config.LOCAL_MODEL_SIZES:
-        _live_local_popup.addItemWithTitle_(size)
 
     engine_section = nsui.section("Engine", [
         nsui.row("Live engine", _live_engine_popup),
@@ -258,7 +280,7 @@ def build_live_page():
               "independently of the engine and model used for regular "
               "dictation.")
 
-    cloud_section = nsui.section("OpenRouter", [
+    _live_cloud_section_view = nsui.section("OpenRouter", [
         nsui.row("Cloud model", _live_model_popup),
         nsui.row("Model list", nsui.hstack_control([
             _live_status_label,
@@ -268,15 +290,21 @@ def build_live_page():
               "re-transcribes every second or so, so a fast, cheap model "
               "usually works better here than your most accurate one.")
 
-    local_section = nsui.section("Local", [
+    _live_local_section_view = nsui.section("Local", [
         nsui.row("Local model", _live_local_popup),
     ], footer="Smaller models respond faster, which matters more for live "
               "typing than for a one-shot dictation.")
 
+    # This page's cloud model list reads the API key straight from config
+    # (not a live text field), so it's safe to kick off the first fetch
+    # right here rather than deferring to refresh_all() — build_live_page()
+    # itself only ever runs once per session.
+    _on_refresh_live_models()
+
     return nsui.scroll_page([
         engine_section,
-        cloud_section,
-        local_section,
+        _live_cloud_section_view,
+        _live_local_section_view,
         _save_footer(),
     ])
 
@@ -291,6 +319,10 @@ def build_chat_page():
     nsui.activate([_chat_status_label.widthAnchor().constraintEqualToConstant_(150.0)])
 
     _chat_bubble_checkbox = nsui.checkbox()
+
+    # Same reasoning as build_live_page(): reads the API key from config
+    # directly, and this function only runs once per session.
+    _on_refresh_chat_settings_models()
 
     return nsui.scroll_page([
         nsui.section("Model", [
@@ -316,9 +348,10 @@ def build_chat_page():
 def build_models_page():
     global _active_local_popup
 
+    # Populated by _refresh_local_rows() (via refresh_all(), which always
+    # runs right after this page is built), so items can be labelled with
+    # actual download status instead of a bare list of sizes.
     _active_local_popup = _popup()
-    for size in config.LOCAL_MODEL_SIZES:
-        _active_local_popup.addItemWithTitle_(size)
 
     _local_rows.clear()
     model_rows = []
@@ -365,6 +398,35 @@ def _slider_target():
     target = ButtonTarget.alloc().initWithCallback_(lambda _sender: _update_noise_label())
     keep_alive(target)
     return target
+
+
+def _selected_engine(popup):
+    index = popup.indexOfSelectedItem()
+    if 0 <= index < len(ENGINE_OPTIONS):
+        return ENGINE_OPTIONS[index][0]
+    return "cloud"
+
+
+def _on_engine_changed():
+    """Configuration page: the OpenRouter fields are meaningless while the
+    local engine is selected, so hide them rather than leave them sitting
+    there unused. The saved API key/model are untouched — only visibility
+    changes."""
+    if _engine_popup is None or _cloud_section_view is None:
+        return
+    _cloud_section_view.setHidden_(_selected_engine(_engine_popup) == "local")
+
+
+def _on_live_engine_changed():
+    """Live Transcript page: same idea, but both directions — only one of
+    the OpenRouter/Local sections is ever relevant at a time."""
+    if _live_engine_popup is None:
+        return
+    engine = _selected_engine(_live_engine_popup)
+    if _live_cloud_section_view is not None:
+        _live_cloud_section_view.setHidden_(engine != "cloud")
+    if _live_local_section_view is not None:
+        _live_local_section_view.setHidden_(engine != "local")
 
 
 def _populate_model_popup(popup, models_list, selected_id):
@@ -471,6 +533,20 @@ def _populate_chat_settings_model_popup(selected_id):
         _chat_model_popup.selectItemAtIndex_(_chat_model_popup.numberOfItems() - 1)
 
 
+def _populate_local_size_popup(popup, selected_size):
+    if popup is None:
+        return
+    current_index = popup.indexOfSelectedItem()
+    popup.removeAllItems()
+    for size in config.LOCAL_MODEL_SIZES:
+        title = size if is_downloaded(size, config.LOCAL_MODELS_DIR) else f"{size} (not downloaded)"
+        popup.addItemWithTitle_(title)
+    if selected_size in config.LOCAL_MODEL_SIZES:
+        popup.selectItemAtIndex_(config.LOCAL_MODEL_SIZES.index(selected_size))
+    elif 0 <= current_index < popup.numberOfItems():
+        popup.selectItemAtIndex_(current_index)
+
+
 def _refresh_local_rows():
     for size, widgets in _local_rows.items():
         if is_downloaded(size, config.LOCAL_MODELS_DIR):
@@ -481,6 +557,15 @@ def _refresh_local_rows():
             widgets["status"].setStringValue_("Not downloaded")
             widgets["button"].setTitle_("Download")
 
+    # Both local-model picker popups reflect actual disk state, so they stay
+    # in sync with the Model Library rows above without any extra wiring.
+    _populate_local_size_popup(
+        _active_local_popup, config.load()["local_model_size"]
+    )
+    _populate_local_size_popup(
+        _live_local_popup, config.load()["live_local_model_size"]
+    )
+
 
 def _on_local_row_action(size):
     if is_downloaded(size, config.LOCAL_MODELS_DIR):
@@ -488,13 +573,23 @@ def _on_local_row_action(size):
         _refresh_local_rows()
         return
 
-    _local_rows[size]["status"].setStringValue_("Downloading...")
+    _local_rows[size]["status"].setStringValue_("0%")
     _local_rows[size]["button"].setEnabled_(False)
+
+    last_shown = [-1]
+
+    def on_progress(fraction):
+        percent = int(fraction * 100)
+        if percent == last_shown[0]:
+            return  # throttled: a fast download can tick many times a second
+        last_shown[0] = percent
+        AppHelper.callAfter(_local_rows[size]["status"].setStringValue_, f"{percent}%")
 
     def download():
         try:
-            from transcriber.local_whisper import _get_model
+            from transcriber.local_whisper import _get_model, download_with_progress
 
+            download_with_progress(size, config.LOCAL_MODELS_DIR, on_progress)
             _get_model(size, config.LOCAL_MODELS_DIR)
         except Exception as e:
             def on_error():
@@ -603,6 +698,8 @@ def refresh_all():
     cfg = config.load()
 
     if _api_key_field is not None:
+        global _config_auto_refreshed
+
         _api_key_field.setStringValue_(cfg["openrouter_api_key"])
         _populate_model_popup(_model_popup, _available_models, cfg["model"])
         if not _available_models:
@@ -613,18 +710,22 @@ def refresh_all():
         engine_ids = [e[0] for e in ENGINE_OPTIONS]
         if cfg["engine"] in engine_ids:
             _engine_popup.selectItemAtIndex_(engine_ids.index(cfg["engine"]))
+        _on_engine_changed()
 
-    if _active_local_popup is not None:
-        if cfg["local_model_size"] in config.LOCAL_MODEL_SIZES:
-            _active_local_popup.selectItemAtIndex_(
-                config.LOCAL_MODEL_SIZES.index(cfg["local_model_size"])
-            )
-        _refresh_local_rows()
+        # Deferred to here (rather than build_configuration_page(), like the
+        # Live/Chat pages do) because this page's refresh reads the API key
+        # from the text field above, which only just got its saved value —
+        # at build time it would still be empty. refresh_all() runs on
+        # every page visit, so this is guarded to fire only once.
+        if not _config_auto_refreshed:
+            _config_auto_refreshed = True
+            _on_refresh_models()
 
     if _live_engine_popup is not None:
         engine_ids = [e[0] for e in ENGINE_OPTIONS]
         if cfg["live_engine"] in engine_ids:
             _live_engine_popup.selectItemAtIndex_(engine_ids.index(cfg["live_engine"]))
+        _on_live_engine_changed()
 
         _populate_model_popup(_live_model_popup, _live_available_models, cfg["live_model"])
         if not _live_available_models:
@@ -633,10 +734,11 @@ def refresh_all():
                 _live_model_popup.addItemWithTitle_(cfg["live_model"])
         _live_status_label.setStringValue_("")
 
-        if cfg["live_local_model_size"] in config.LOCAL_MODEL_SIZES:
-            _live_local_popup.selectItemAtIndex_(
-                config.LOCAL_MODEL_SIZES.index(cfg["live_local_model_size"])
-            )
+    # Runs whenever either popup exists: it repopulates both (download
+    # status can only be known by checking disk), plus the Model Library
+    # rows when that page has been built.
+    if _active_local_popup is not None or _live_local_popup is not None:
+        _refresh_local_rows()
 
     if _chat_model_popup is not None:
         _populate_chat_settings_model_popup(cfg["chat_model"])

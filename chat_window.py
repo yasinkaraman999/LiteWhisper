@@ -16,6 +16,8 @@ import objc
 import rumps
 from AppKit import (
     NSApp,
+    NSBox,
+    NSBoxCustom,
     NSButton,
     NSColor,
     NSEvent,
@@ -24,26 +26,39 @@ from AppKit import (
     NSImage,
     NSImageScaleProportionallyUpOrDown,
     NSImageView,
+    NSMakeRect,
     NSMenu,
     NSMenuItem,
     NSModalResponseOK,
+    NSNoBorder,
+    NSNoTitle,
     NSOpenPanel,
     NSPopUpButton,
     NSScrollView,
+    NSSplitViewController,
+    NSSplitViewItem,
     NSTableCellView,
     NSTableColumn,
     NSTableView,
     NSTextView,
+    NSTitlebarSeparatorStyleNone,
+    NSToolbar,
+    NSToolbarDisplayModeIconOnly,
     NSView,
+    NSViewController,
+    NSViewWidthSizable,
     NSWindow,
     NSWindowStyleMaskClosable,
+    NSWindowStyleMaskFullSizeContentView,
     NSWindowStyleMaskMiniaturizable,
     NSWindowStyleMaskResizable,
     NSWindowStyleMaskTitled,
+    NSWindowToolbarStyleUnified,
 )
 from Foundation import NSIndexSet, NSObject
 from PyObjCTools import AppHelper
 
+import app_activation
 import chat_engine
 import chat_history
 import config
@@ -52,12 +67,14 @@ import models
 import nsui
 import theme
 from audio_recorder import AudioRecorder
+from main_window import ToolbarDelegate
 from transcriber import get_transcriber
-from ui_helpers import ButtonTarget, keep_alive
+from ui_helpers import ButtonTarget, WindowCloseObserver, keep_alive
 
 WINDOW_WIDTH = 720.0
 WINDOW_HEIGHT = 560.0
-SIDEBAR_WIDTH = 200.0
+SIDEBAR_MIN_WIDTH = 180.0
+SIDEBAR_MAX_WIDTH = 260.0
 BUBBLE_MAX_WIDTH = 420.0
 THUMBNAIL_SIZE = 72.0
 INPUT_HEIGHT = 76.0
@@ -171,6 +188,22 @@ class InputDelegate(NSObject):
         return False
 
 
+class ChatSidebarController(NSViewController):
+    """Hosts the conversation list as a real NSSplitViewItem sidebar —
+    draggable, resizable and collapsible via the toolbar, the same as the
+    main window's — instead of a fixed-width plain view."""
+
+    def loadView(self):
+        self.setView_(_build_sidebar())
+
+
+class ChatMainController(NSViewController):
+    """Hosts the model row, message list and input row."""
+
+    def loadView(self):
+        self.setView_(_build_main_pane())
+
+
 # --------------------------------------------------------------- building
 
 
@@ -259,20 +292,52 @@ def _build_input_row():
     _mic_button = _icon_button("mic.fill", _on_mic_clicked, tooltip="Dictate")
     send_button = _icon_button("arrow.up.circle.fill", _on_send, tooltip="Send")
 
-    _input_view = NSTextView.alloc().init()
+    # NSTextView as an NSScrollView's documentView is sized the classic
+    # autoresizing way, not via Auto Layout constraints on the text view
+    # itself — skipping this configuration is what left the previous
+    # version with a degenerate frame that couldn't actually be typed into.
+    _input_view = NSTextView.alloc().initWithFrame_(NSMakeRect(0, 0, 100, 60))
+    _input_view.setMinSize_((0.0, 0.0))
+    _input_view.setMaxSize_((1.0e7, 1.0e7))
+    _input_view.setVerticallyResizable_(True)
+    _input_view.setHorizontallyResizable_(False)
+    _input_view.setAutoresizingMask_(NSViewWidthSizable)
+    _input_view.textContainer().setContainerSize_((0.0, 1.0e7))
+    _input_view.textContainer().setWidthTracksTextView_(True)
+    _input_view.setTextContainerInset_((6.0, 6.0))
     _input_view.setFont_(NSFont.systemFontOfSize_(13.0))
     _input_view.setRichText_(False)
     _input_view.setAutomaticQuoteSubstitutionEnabled_(False)
+    _input_view.setEditable_(True)
+    _input_view.setSelectable_(True)
+    _input_view.setDrawsBackground_(False)
     delegate = InputDelegate.alloc().initWithCallback_(_on_send)
     keep_alive(delegate)
     _input_view.setDelegate_(delegate)
 
     input_scroll = nsui.anchor(NSScrollView.alloc().init())
     input_scroll.setHasVerticalScroller_(True)
+    input_scroll.setHasHorizontalScroller_(False)
+    input_scroll.setAutohidesScrollers_(True)
+    input_scroll.setDrawsBackground_(False)
+    input_scroll.setBorderType_(NSNoBorder)
     input_scroll.setDocumentView_(_input_view)
 
+    # A rounded, filled box (same corner-radius language as nsui.bubble/
+    # nsui.group) instead of the scroll view's default bezel border, so the
+    # input area reads as a proper field rather than a bare scroll view.
+    input_box = nsui.anchor(NSBox.alloc().init())
+    input_box.setBoxType_(NSBoxCustom)
+    input_box.setTitlePosition_(NSNoTitle)
+    input_box.setBorderWidth_(0.0)
+    input_box.setCornerRadius_(12.0)
+    input_box.setFillColor_(theme.GROUP_FILL)
+    input_box.setContentViewMargins_((0.0, 0.0))
+    input_box.setContentView_(input_scroll)
+    nsui.pin(input_scroll, input_box, inset=2.0)
+
     row = nsui.anchor(NSView.alloc().init())
-    for view in (_attach_button, _mic_button, input_scroll, send_button):
+    for view in (_attach_button, _mic_button, input_box, send_button):
         row.addSubview_(view)
 
     nsui.activate([
@@ -282,11 +347,11 @@ def _build_input_row():
         _mic_button.leadingAnchor().constraintEqualToAnchor_constant_(_attach_button.trailingAnchor(), 4.0),
         _mic_button.centerYAnchor().constraintEqualToAnchor_(row.centerYAnchor()),
 
-        input_scroll.leadingAnchor().constraintEqualToAnchor_constant_(_mic_button.trailingAnchor(), 8.0),
-        input_scroll.topAnchor().constraintEqualToAnchor_constant_(row.topAnchor(), 10.0),
-        input_scroll.bottomAnchor().constraintEqualToAnchor_constant_(row.bottomAnchor(), -10.0),
+        input_box.leadingAnchor().constraintEqualToAnchor_constant_(_mic_button.trailingAnchor(), 8.0),
+        input_box.topAnchor().constraintEqualToAnchor_constant_(row.topAnchor(), 10.0),
+        input_box.bottomAnchor().constraintEqualToAnchor_constant_(row.bottomAnchor(), -10.0),
 
-        send_button.leadingAnchor().constraintEqualToAnchor_constant_(input_scroll.trailingAnchor(), 8.0),
+        send_button.leadingAnchor().constraintEqualToAnchor_constant_(input_box.trailingAnchor(), 8.0),
         send_button.trailingAnchor().constraintEqualToAnchor_constant_(row.trailingAnchor(), -10.0),
         send_button.centerYAnchor().constraintEqualToAnchor_(row.centerYAnchor()),
     ])
@@ -324,38 +389,53 @@ def _build_main_pane():
 
 
 def _build_window():
-    window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-        ((0, 0), (WINDOW_WIDTH, WINDOW_HEIGHT)),
+    sidebar_controller = ChatSidebarController.alloc().init()
+    main_controller = ChatMainController.alloc().init()
+
+    split = NSSplitViewController.alloc().init()
+
+    sidebar_item = NSSplitViewItem.sidebarWithViewController_(sidebar_controller)
+    sidebar_item.setMinimumThickness_(SIDEBAR_MIN_WIDTH)
+    sidebar_item.setMaximumThickness_(SIDEBAR_MAX_WIDTH)
+    sidebar_item.setAllowsFullHeightLayout_(True)
+    sidebar_item.setTitlebarSeparatorStyle_(NSTitlebarSeparatorStyleNone)
+    split.addSplitViewItem_(sidebar_item)
+
+    main_item = NSSplitViewItem.splitViewItemWithViewController_(main_controller)
+    main_item.setAutomaticallyAdjustsSafeAreaInsets_(True)
+    main_item.setTitlebarSeparatorStyle_(NSTitlebarSeparatorStyleNone)
+    split.addSplitViewItem_(main_item)
+
+    style = (
         NSWindowStyleMaskTitled
         | NSWindowStyleMaskClosable
         | NSWindowStyleMaskMiniaturizable
-        | NSWindowStyleMaskResizable,
-        2,
-        False,
+        | NSWindowStyleMaskResizable
+        | NSWindowStyleMaskFullSizeContentView
     )
-    window.setTitle_("Chat")
+    window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+        ((0, 0), (WINDOW_WIDTH, WINDOW_HEIGHT)), style, 2, False
+    )
+    window.setContentViewController_(split)
+    window.setContentSize_((WINDOW_WIDTH, WINDOW_HEIGHT))
     window.setReleasedWhenClosed_(False)
+    window.setTitle_("Chat")
     window.setMinSize_((520, 380))
 
-    root = nsui.anchor(NSView.alloc().init())
-    window.setContentView_(root)
+    toolbar_delegate = ToolbarDelegate.alloc().init()
+    keep_alive(toolbar_delegate)
+    toolbar = NSToolbar.alloc().initWithIdentifier_("LiteWhisperChatToolbar")
+    toolbar.setDelegate_(toolbar_delegate)
+    toolbar.setAllowsUserCustomization_(False)
+    toolbar.setDisplayMode_(NSToolbarDisplayModeIconOnly)
+    window.setToolbar_(toolbar)
+    window.setToolbarStyle_(NSWindowToolbarStyleUnified)
 
-    sidebar = _build_sidebar()
-    main_pane = _build_main_pane()
-    root.addSubview_(sidebar)
-    root.addSubview_(main_pane)
-
-    nsui.activate([
-        sidebar.topAnchor().constraintEqualToAnchor_(root.topAnchor()),
-        sidebar.bottomAnchor().constraintEqualToAnchor_(root.bottomAnchor()),
-        sidebar.leadingAnchor().constraintEqualToAnchor_(root.leadingAnchor()),
-        sidebar.widthAnchor().constraintEqualToConstant_(SIDEBAR_WIDTH),
-
-        main_pane.topAnchor().constraintEqualToAnchor_(root.topAnchor()),
-        main_pane.bottomAnchor().constraintEqualToAnchor_(root.bottomAnchor()),
-        main_pane.leadingAnchor().constraintEqualToAnchor_(sidebar.trailingAnchor()),
-        main_pane.trailingAnchor().constraintEqualToAnchor_(root.trailingAnchor()),
-    ])
+    close_observer = WindowCloseObserver.alloc().initWithCallback_(
+        lambda: app_activation.note_window_closed("chat")
+    )
+    keep_alive(close_observer)
+    window.setDelegate_(close_observer)
 
     window.center()
     return window
@@ -699,3 +779,4 @@ def show():
 
     _window.makeKeyAndOrderFront_(None)
     NSApp.activateIgnoringOtherApps_(True)
+    app_activation.note_window_shown("chat")
