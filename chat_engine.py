@@ -6,6 +6,7 @@ messages carry conversation history plus optional images instead of audio.
 """
 
 import base64
+import json
 
 import requests
 
@@ -43,9 +44,16 @@ def _content(text, image_paths):
     return parts
 
 
-def send(messages, model, api_key):
+def stream(messages, model, api_key, cancel_event=None):
     """messages: [{"role": "user"/"assistant", "text": ..., "image_paths": [...]}]
-    in chronological order. Returns the assistant's reply text."""
+    in chronological order. Yields the assistant's reply text chunk by
+    chunk as they arrive over OpenRouter's SSE stream, standard
+    OpenAI-compatible format (`data: {...}` lines, terminated by
+    `data: [DONE]`, text in choices[0].delta.content).
+
+    Stops early — closing the connection rather than reading it to
+    completion — the moment cancel_event is set, checked between chunks.
+    """
     if not api_key:
         raise ValueError("OpenRouter API key not set")
     if not model:
@@ -59,8 +67,9 @@ def send(messages, model, api_key):
     response = requests.post(
         CHAT_API_URL,
         headers={"Authorization": f"Bearer {api_key}"},
-        json={"model": model, "messages": payload_messages},
+        json={"model": model, "messages": payload_messages, "stream": True},
         timeout=60,
+        stream=True,
     )
     try:
         response.raise_for_status()
@@ -68,8 +77,24 @@ def send(messages, model, api_key):
         detail = response.text[:200]
         raise RuntimeError(f"OpenRouter returned an error ({response.status_code}): {detail}") from e
 
-    body = response.json()
-    choices = body.get("choices") or []
-    if not choices:
-        raise RuntimeError(f"Unexpected OpenRouter response: {body}")
-    return choices[0]["message"]["content"]
+    try:
+        for raw_line in response.iter_lines(decode_unicode=True):
+            if cancel_event is not None and cancel_event.is_set():
+                return
+            if not raw_line or not raw_line.startswith("data: "):
+                continue
+            data = raw_line[len("data: "):]
+            if data == "[DONE]":
+                return
+            try:
+                chunk = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            choices = chunk.get("choices") or []
+            if not choices:
+                continue
+            content = (choices[0].get("delta") or {}).get("content")
+            if content:
+                yield content
+    finally:
+        response.close()

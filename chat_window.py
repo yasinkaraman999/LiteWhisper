@@ -20,11 +20,14 @@ from AppKit import (
     NSBoxCustom,
     NSButton,
     NSColor,
+    NSControlSizeSmall,
     NSEvent,
     NSEventModifierFlagShift,
     NSFont,
+    NSFontWeightMedium,
     NSImage,
     NSImageScaleProportionallyUpOrDown,
+    NSImageSymbolConfiguration,
     NSImageView,
     NSMakeRect,
     NSMenu,
@@ -34,6 +37,8 @@ from AppKit import (
     NSNoTitle,
     NSOpenPanel,
     NSPopUpButton,
+    NSProgressIndicator,
+    NSProgressIndicatorStyleSpinning,
     NSScrollView,
     NSSplitViewController,
     NSSplitViewItem,
@@ -71,13 +76,15 @@ from main_window import ToolbarDelegate
 from transcriber import get_transcriber
 from ui_helpers import ButtonTarget, WindowCloseObserver, keep_alive
 
-WINDOW_WIDTH = 720.0
-WINDOW_HEIGHT = 560.0
+WINDOW_WIDTH = 880.0
+WINDOW_HEIGHT = 640.0
 SIDEBAR_MIN_WIDTH = 180.0
 SIDEBAR_MAX_WIDTH = 260.0
-BUBBLE_MAX_WIDTH = 420.0
+BUBBLE_MAX_WIDTH = 560.0
 THUMBNAIL_SIZE = 72.0
 INPUT_HEIGHT = 76.0
+ICON_BUTTON_SIZE = 34.0
+ICON_GLYPH_POINT_SIZE = 16.0
 MIC_OWNER = "chat"
 IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "gif", "webp"]
 
@@ -93,9 +100,18 @@ _available_models = []  # [{"id", "name", "supports_images"}]
 _input_view = None
 _attach_button = None
 _mic_button = None
+_send_button = None
 _pending_images = []  # local file paths staged for the next send
 _recording = False
 _recorder = None
+
+# "idle" or "streaming" — drives the send/stop button and whether the
+# input row accepts new input.
+_send_state = "idle"
+_stream_cancel_event = None
+_streaming_row = None
+_streaming_label = None
+_streaming_spinner = None
 
 
 # --------------------------------------------------------------- helpers
@@ -115,7 +131,10 @@ def _parse(raw):
 def _icon_button(symbol, callback, tooltip=""):
     button = nsui.anchor(NSButton.alloc().init())
     image = NSImage.imageWithSystemSymbolName_accessibilityDescription_(symbol, tooltip)
-    button.setImage_(image)
+    configuration = NSImageSymbolConfiguration.configurationWithPointSize_weight_(
+        ICON_GLYPH_POINT_SIZE, NSFontWeightMedium
+    )
+    button.setImage_(image.imageWithSymbolConfiguration_(configuration))
     button.setBordered_(False)
     button.setToolTip_(tooltip)
     target = ButtonTarget.alloc().initWithCallback_(lambda _sender: callback())
@@ -123,10 +142,19 @@ def _icon_button(symbol, callback, tooltip=""):
     button.setTarget_(target)
     button.setAction_("clicked:")
     nsui.activate([
-        button.widthAnchor().constraintEqualToConstant_(28.0),
-        button.heightAnchor().constraintEqualToConstant_(28.0),
+        button.widthAnchor().constraintEqualToConstant_(ICON_BUTTON_SIZE),
+        button.heightAnchor().constraintEqualToConstant_(ICON_BUTTON_SIZE),
     ])
     return button
+
+
+def _set_icon(button, symbol, tooltip):
+    image = NSImage.imageWithSystemSymbolName_accessibilityDescription_(symbol, tooltip)
+    configuration = NSImageSymbolConfiguration.configurationWithPointSize_weight_(
+        ICON_GLYPH_POINT_SIZE, NSFontWeightMedium
+    )
+    button.setImage_(image.imageWithSymbolConfiguration_(configuration))
+    button.setToolTip_(tooltip)
 
 
 # ------------------------------------------------------------- AppKit glue
@@ -286,11 +314,11 @@ def _build_model_row():
 
 
 def _build_input_row():
-    global _input_view, _attach_button, _mic_button
+    global _input_view, _attach_button, _mic_button, _send_button
 
     _attach_button = _icon_button("paperclip", _on_attach_image, tooltip="Attach image")
     _mic_button = _icon_button("mic.fill", _on_mic_clicked, tooltip="Dictate")
-    send_button = _icon_button("arrow.up.circle.fill", _on_send, tooltip="Send")
+    _send_button = _icon_button("arrow.up.circle.fill", _on_send_button_clicked, tooltip="Send")
 
     # NSTextView as an NSScrollView's documentView is sized the classic
     # autoresizing way, not via Auto Layout constraints on the text view
@@ -305,7 +333,7 @@ def _build_input_row():
     _input_view.textContainer().setContainerSize_((0.0, 1.0e7))
     _input_view.textContainer().setWidthTracksTextView_(True)
     _input_view.setTextContainerInset_((6.0, 6.0))
-    _input_view.setFont_(NSFont.systemFontOfSize_(13.0))
+    _input_view.setFont_(NSFont.systemFontOfSize_(14.0))
     _input_view.setRichText_(False)
     _input_view.setAutomaticQuoteSubstitutionEnabled_(False)
     _input_view.setEditable_(True)
@@ -323,38 +351,39 @@ def _build_input_row():
     input_scroll.setBorderType_(NSNoBorder)
     input_scroll.setDocumentView_(_input_view)
 
-    # A rounded, filled box (same corner-radius language as nsui.bubble/
-    # nsui.group) instead of the scroll view's default bezel border, so the
-    # input area reads as a proper field rather than a bare scroll view.
-    input_box = nsui.anchor(NSBox.alloc().init())
-    input_box.setBoxType_(NSBoxCustom)
-    input_box.setTitlePosition_(NSNoTitle)
-    input_box.setBorderWidth_(0.0)
-    input_box.setCornerRadius_(12.0)
-    input_box.setFillColor_(theme.GROUP_FILL)
-    input_box.setContentViewMargins_((0.0, 0.0))
-    input_box.setContentView_(input_scroll)
-    nsui.pin(input_scroll, input_box, inset=2.0)
+    # The whole row is one rounded pill (attach + mic + text + send all
+    # inside it), the way ChatGPT's own input field is built, rather than
+    # icon buttons sitting outside a separately boxed text field.
+    row = nsui.anchor(NSBox.alloc().init())
+    row.setBoxType_(NSBoxCustom)
+    row.setTitlePosition_(NSNoTitle)
+    row.setBorderWidth_(0.0)
+    row.setCornerRadius_(18.0)
+    row.setFillColor_(theme.GROUP_FILL)
+    row.setContentViewMargins_((0.0, 0.0))
 
-    row = nsui.anchor(NSView.alloc().init())
-    for view in (_attach_button, _mic_button, input_box, send_button):
-        row.addSubview_(view)
+    content = nsui.anchor(NSView.alloc().init())
+    for view in (_attach_button, _mic_button, input_scroll, _send_button):
+        content.addSubview_(view)
 
     nsui.activate([
-        _attach_button.leadingAnchor().constraintEqualToAnchor_constant_(row.leadingAnchor(), 10.0),
-        _attach_button.centerYAnchor().constraintEqualToAnchor_(row.centerYAnchor()),
+        _attach_button.leadingAnchor().constraintEqualToAnchor_constant_(content.leadingAnchor(), 8.0),
+        _attach_button.centerYAnchor().constraintEqualToAnchor_(content.centerYAnchor()),
 
-        _mic_button.leadingAnchor().constraintEqualToAnchor_constant_(_attach_button.trailingAnchor(), 4.0),
-        _mic_button.centerYAnchor().constraintEqualToAnchor_(row.centerYAnchor()),
+        _mic_button.leadingAnchor().constraintEqualToAnchor_constant_(_attach_button.trailingAnchor(), 2.0),
+        _mic_button.centerYAnchor().constraintEqualToAnchor_(content.centerYAnchor()),
 
-        input_box.leadingAnchor().constraintEqualToAnchor_constant_(_mic_button.trailingAnchor(), 8.0),
-        input_box.topAnchor().constraintEqualToAnchor_constant_(row.topAnchor(), 10.0),
-        input_box.bottomAnchor().constraintEqualToAnchor_constant_(row.bottomAnchor(), -10.0),
+        input_scroll.leadingAnchor().constraintEqualToAnchor_constant_(_mic_button.trailingAnchor(), 6.0),
+        input_scroll.topAnchor().constraintEqualToAnchor_constant_(content.topAnchor(), 8.0),
+        input_scroll.bottomAnchor().constraintEqualToAnchor_constant_(content.bottomAnchor(), -8.0),
 
-        send_button.leadingAnchor().constraintEqualToAnchor_constant_(input_box.trailingAnchor(), 8.0),
-        send_button.trailingAnchor().constraintEqualToAnchor_constant_(row.trailingAnchor(), -10.0),
-        send_button.centerYAnchor().constraintEqualToAnchor_(row.centerYAnchor()),
+        _send_button.leadingAnchor().constraintEqualToAnchor_constant_(input_scroll.trailingAnchor(), 6.0),
+        _send_button.trailingAnchor().constraintEqualToAnchor_constant_(content.trailingAnchor(), -8.0),
+        _send_button.centerYAnchor().constraintEqualToAnchor_(content.centerYAnchor()),
     ])
+
+    row.setContentView_(content)
+    nsui.pin(content, row)
     return row
 
 
@@ -488,12 +517,18 @@ def _aligned_row(inner, is_user):
 
 
 def _text_row(message, is_user):
-    when = _parse(message["created_at"])
-    meta = when.strftime("%H:%M") if when else ""
-    tint = NSColor.controlAccentColor().colorWithAlphaComponent_(0.18) if is_user else theme.GROUP_FILL
-    box = nsui.bubble(message["text"], meta=meta, tint=tint)
-    nsui.activate([box.widthAnchor().constraintLessThanOrEqualToConstant_(BUBBLE_MAX_WIDTH)])
-    return _aligned_row(box, is_user)
+    if is_user:
+        # ChatGPT tints only the user's own messages as a bubble.
+        when = _parse(message["created_at"])
+        meta = when.strftime("%H:%M") if when else ""
+        tint = NSColor.controlAccentColor().colorWithAlphaComponent_(0.18)
+        inner = nsui.bubble(message["text"], meta=meta, tint=tint)
+    else:
+        # Assistant replies are plain text, no bubble — matches ChatGPT.
+        inner = nsui.label(message["text"], size=14.0, multiline=True)
+        inner.setSelectable_(True)
+    nsui.activate([inner.widthAnchor().constraintLessThanOrEqualToConstant_(BUBBLE_MAX_WIDTH)])
+    return _aligned_row(inner, is_user)
 
 
 def _image_row(image_paths, is_user):
@@ -526,6 +561,68 @@ def _refresh_messages():
         AppHelper.callAfter(views[-1].scrollRectToVisible_, views[-1].bounds())
 
 
+# ------------------------------------------------------ streaming replies
+
+
+def _start_streaming_row():
+    """Appends a placeholder assistant row — a small spinner plus an empty
+    label — once, when a send begins. Unlike _refresh_messages(), this
+    doesn't rebuild the whole list: the label is mutated directly as
+    chunks arrive, so streaming text updates stay cheap."""
+    global _streaming_row, _streaming_label, _streaming_spinner
+    if _message_body is None:
+        return
+
+    spinner = nsui.anchor(NSProgressIndicator.alloc().init())
+    spinner.setStyle_(NSProgressIndicatorStyleSpinning)
+    spinner.setControlSize_(NSControlSizeSmall)
+    spinner.setDisplayedWhenStopped_(False)
+    spinner.startAnimation_(None)
+
+    label = nsui.label("", size=14.0, multiline=True)
+
+    inner = nsui.anchor(NSView.alloc().init())
+    inner.addSubview_(spinner)
+    inner.addSubview_(label)
+    nsui.activate([
+        spinner.leadingAnchor().constraintEqualToAnchor_(inner.leadingAnchor()),
+        spinner.centerYAnchor().constraintEqualToAnchor_(inner.centerYAnchor()),
+        spinner.topAnchor().constraintGreaterThanOrEqualToAnchor_(inner.topAnchor()),
+
+        label.leadingAnchor().constraintEqualToAnchor_constant_(spinner.trailingAnchor(), 8.0),
+        label.trailingAnchor().constraintLessThanOrEqualToAnchor_(inner.trailingAnchor()),
+        label.topAnchor().constraintEqualToAnchor_(inner.topAnchor()),
+        label.bottomAnchor().constraintEqualToAnchor_(inner.bottomAnchor()),
+    ])
+    nsui.activate([inner.widthAnchor().constraintLessThanOrEqualToConstant_(BUBBLE_MAX_WIDTH)])
+
+    row = _aligned_row(inner, is_user=False)
+    nsui.set_arranged(_message_body, list(_message_body.arrangedSubviews()) + [row])
+
+    _streaming_row = row
+    _streaming_label = label
+    _streaming_spinner = spinner
+    AppHelper.callAfter(row.scrollRectToVisible_, row.bounds())
+
+
+def _update_streaming_text(text):
+    if _streaming_label is None:
+        return
+    if text and _streaming_spinner is not None:
+        _streaming_spinner.stopAnimation_(None)
+        _streaming_spinner.setHidden_(True)
+    _streaming_label.setStringValue_(text)
+    if _streaming_row is not None:
+        _streaming_row.scrollRectToVisible_(_streaming_row.bounds())
+
+
+def _end_streaming_row():
+    global _streaming_row, _streaming_label, _streaming_spinner
+    _streaming_row = None
+    _streaming_label = None
+    _streaming_spinner = None
+
+
 # ---------------------------------------------------------- conversations
 
 
@@ -552,6 +649,11 @@ def _select_row_for(conversation_id):
 def _select_conversation(conversation_id):
     global _current_conversation_id
     if conversation_id == _current_conversation_id:
+        return
+    if _send_state == "streaming":
+        # Switching conversations mid-reply would leave the streaming
+        # update writing into a conversation that's no longer on screen.
+        _select_row_for(_current_conversation_id)
         return
     _current_conversation_id = conversation_id
     _refresh_messages()
@@ -706,8 +808,38 @@ def _insert_dictated_text(text):
 # ---------------------------------------------------------------- send
 
 
+def _set_sending_ui(streaming):
+    """Toggles between the normal "ready to send" state and "a reply is
+    streaming in" — swaps the send/stop icon and locks the input row so a
+    new message can't be started until the current one is stopped."""
+    global _send_state
+    _send_state = "streaming" if streaming else "idle"
+    _input_view.setEditable_(not streaming)
+    _attach_button.setEnabled_(not streaming)
+    _mic_button.setEnabled_(not streaming)
+    if streaming:
+        _set_icon(_send_button, "stop.circle.fill", "Stop")
+    else:
+        _set_icon(_send_button, "arrow.up.circle.fill", "Send")
+
+
+def _on_send_button_clicked():
+    if _send_state == "streaming":
+        _on_stop_streaming()
+    else:
+        _on_send()
+
+
+def _on_stop_streaming():
+    if _stream_cancel_event is not None:
+        _stream_cancel_event.set()
+
+
 def _on_send():
-    global _pending_images
+    global _pending_images, _stream_cancel_event
+
+    if _send_state == "streaming":
+        return
 
     if _current_conversation_id is None:
         _on_new_chat()
@@ -743,20 +875,35 @@ def _on_send():
         for m in chat_history.load_messages(conversation_id)
     ]
 
+    cancel_event = threading.Event()
+    _stream_cancel_event = cancel_event
+    _set_sending_ui(True)
+    _start_streaming_row()
+
     def call_api():
+        accumulated = []
+        error = None
         try:
-            reply = chat_engine.send(history_for_api, model, cfg["openrouter_api_key"])
+            for chunk in chat_engine.stream(
+                history_for_api, model, cfg["openrouter_api_key"], cancel_event
+            ):
+                accumulated.append(chunk)
+                AppHelper.callAfter(_update_streaming_text, "".join(accumulated))
         except Exception as e:
-            AppHelper.callAfter(
-                rumps.notification, "lite-whisper", "Chat error", str(e)
-            )
-            return
+            error = e
+
+        final_text = "".join(accumulated)
 
         def on_done():
-            chat_history.append_message(conversation_id, "assistant", reply)
+            _end_streaming_row()
+            _set_sending_ui(False)
+            if final_text:
+                chat_history.append_message(conversation_id, "assistant", final_text)
             if conversation_id == _current_conversation_id:
                 _refresh_messages()
             _refresh_sidebar()
+            if error is not None:
+                rumps.notification("lite-whisper", "Chat error", str(error))
 
         AppHelper.callAfter(on_done)
 
