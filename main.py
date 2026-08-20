@@ -3,6 +3,8 @@ import threading
 import rumps
 from PyObjCTools import AppHelper
 
+import chat_bubble
+import chat_window
 import config
 import history
 import hotkey
@@ -34,6 +36,7 @@ class LiteWhisperApp(rumps.App):
         self.menu = [
             self.record_item,
             "Open LiteWhisper",
+            "Chat",
             "History",
             "Permissions",
             "Settings",
@@ -47,6 +50,7 @@ class LiteWhisperApp(rumps.App):
             level_source=lambda: self.recorder.level,
             live_stop_callback=self.on_live_toggle,
         )
+        chat_bubble.configure(on_click=chat_window.show)
         self._overlay_state("idle")
         self._listener = hotkey.start_listener(
             self.on_toggle,
@@ -58,6 +62,10 @@ class LiteWhisperApp(rumps.App):
     @rumps.clicked("Open LiteWhisper")
     def open_main_window(self, _):
         self._show_window("home")
+
+    @rumps.clicked("Chat")
+    def open_chat(self, _):
+        chat_window.show()
 
     @rumps.clicked("History")
     def show_history(self, _):

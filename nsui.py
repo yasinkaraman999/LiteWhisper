@@ -26,6 +26,7 @@ from AppKit import (
     NSScrollView,
     NSStackView,
     NSSwitchButton,
+    NSTextAlignmentRight,
     NSTextField,
     NSUserInterfaceLayoutOrientationVertical,
     NSView,
@@ -275,6 +276,75 @@ def row(title, control=None, subtitle=None, stretch=False):
 
     activate(constraints)
     return view
+
+
+BUBBLE_RADIUS = 14.0
+BUBBLE_PADDING_X = 12.0
+BUBBLE_PADDING_Y = 9.0
+
+
+def bubble(text, meta=None, tint=None, trailing_gutter=0.0):
+    """A rounded message bubble: text on top, an optional small secondary
+    meta line below it, right-aligned. Shared shape for any chat-style UI
+    (transcription history, the chat window) — callers position/align the
+    returned box themselves.
+
+    `trailing_gutter` reserves extra space on the right of the text, e.g.
+    for a hover-revealed button drawn over the bubble by the caller.
+    """
+    text_field = label(text, size=13.0, multiline=True)
+    text_field.setSelectable_(True)
+
+    content = anchor(NSView.alloc().init())
+    content.addSubview_(text_field)
+
+    constraints = [
+        text_field.topAnchor().constraintEqualToAnchor_constant_(
+            content.topAnchor(), BUBBLE_PADDING_Y
+        ),
+        text_field.leadingAnchor().constraintEqualToAnchor_constant_(
+            content.leadingAnchor(), BUBBLE_PADDING_X
+        ),
+        text_field.trailingAnchor().constraintEqualToAnchor_constant_(
+            content.trailingAnchor(), -(BUBBLE_PADDING_X + trailing_gutter)
+        ),
+    ]
+
+    previous = text_field
+    if meta:
+        meta_field = secondary(meta, size=10.0)
+        meta_field.setAlignment_(NSTextAlignmentRight)
+        content.addSubview_(meta_field)
+        constraints += [
+            meta_field.topAnchor().constraintEqualToAnchor_constant_(
+                text_field.bottomAnchor(), 3.0
+            ),
+            meta_field.leadingAnchor().constraintGreaterThanOrEqualToAnchor_(
+                text_field.leadingAnchor()
+            ),
+            meta_field.trailingAnchor().constraintEqualToAnchor_constant_(
+                content.trailingAnchor(), -BUBBLE_PADDING_X
+            ),
+        ]
+        previous = meta_field
+
+    constraints.append(
+        previous.bottomAnchor().constraintEqualToAnchor_constant_(
+            content.bottomAnchor(), -BUBBLE_PADDING_Y
+        )
+    )
+    activate(constraints)
+
+    box = anchor(NSBox.alloc().init())
+    box.setBoxType_(NSBoxCustom)
+    box.setTitlePosition_(NSNoTitle)
+    box.setBorderWidth_(0.0)
+    box.setCornerRadius_(BUBBLE_RADIUS)
+    box.setFillColor_(tint if tint is not None else theme.GROUP_FILL)
+    box.setContentViewMargins_((0.0, 0.0))
+    box.setContentView_(content)
+    pin(content, box)
+    return box
 
 
 def group(rows):

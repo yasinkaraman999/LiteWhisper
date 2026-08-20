@@ -30,7 +30,6 @@ from AppKit import (
     NSMakeRect,
     NSPanel,
     NSPointInRect,
-    NSScreen,
     NSShadow,
     NSTextField,
     NSTimer,
@@ -43,6 +42,7 @@ from AppKit import (
 )
 
 import config
+import overlay_dock
 from ui_helpers import ButtonTarget, keep_alive
 
 STYLE_CLASSIC = "classic"
@@ -52,7 +52,6 @@ STYLE_NONE = "none"
 CLASSIC_SIZE = (300.0, 88.0)
 MINI_SIZE = (146.0, 38.0)
 CORNER_RADIUS = 16.0
-SCREEN_MARGIN = 18.0
 
 # Transparent slack around the glass so its shadow has somewhere to fall
 # off. Without it the shadow is clipped at the window edge and reads as a
@@ -84,31 +83,6 @@ _style = STYLE_CLASSIC
 # ---------------------------------------------------------------- docking
 
 
-def _dock_points(size):
-    """Centre point for every slot in the frame of docks around the screen."""
-    screen = NSScreen.mainScreen()
-    if screen is None:
-        return {}
-    area = screen.visibleFrame()
-    width, height = size
-    half_w, half_h = width / 2.0, height / 2.0
-
-    points = {}
-    for slot in range(config.DOCK_SLOTS):
-        fraction = (slot + 0.5) / config.DOCK_SLOTS
-        x = area.origin.x + area.size.width * fraction
-        y = area.origin.y + area.size.height * fraction
-        points[f"top-{slot}"] = (
-            x, area.origin.y + area.size.height - SCREEN_MARGIN - half_h,
-        )
-        points[f"bottom-{slot}"] = (x, area.origin.y + SCREEN_MARGIN + half_h)
-        points[f"left-{slot}"] = (area.origin.x + SCREEN_MARGIN + half_w, y)
-        points[f"right-{slot}"] = (
-            area.origin.x + area.size.width - SCREEN_MARGIN - half_w, y,
-        )
-    return points
-
-
 def _current_size():
     """Size of the visible glass box."""
     return MINI_SIZE if _style == STYLE_MINI else CLASSIC_SIZE
@@ -123,7 +97,7 @@ def _panel_size():
 def _move_to_dock(dock_name, animate=False):
     # Docking is measured against the visible box, so the shadow padding
     # does not push the panel away from the screen edge.
-    points = _dock_points(_current_size())
+    points = overlay_dock.dock_points(_current_size())
     center = points.get(dock_name) or points.get(config.DEFAULTS["recording_window_dock"])
     if center is None or _panel is None:
         return
@@ -137,12 +111,7 @@ def _nearest_dock():
     frame = _panel.frame()
     cx = frame.origin.x + frame.size.width / 2.0
     cy = frame.origin.y + frame.size.height / 2.0
-    best, best_distance = None, None
-    for name, (px, py) in _dock_points(_current_size()).items():
-        distance = (px - cx) ** 2 + (py - cy) ** 2
-        if best_distance is None or distance < best_distance:
-            best, best_distance = name, distance
-    return best
+    return overlay_dock.nearest_dock((cx, cy), _current_size())
 
 
 # ------------------------------------------------------------------ views

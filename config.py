@@ -5,6 +5,7 @@ CONFIG_DIR = Path.home() / ".config" / "lite-whisper"
 CONFIG_PATH = CONFIG_DIR / "config.json"
 LOCAL_MODELS_DIR = CONFIG_DIR / "models"
 DEBUG_AUDIO_DIR = CONFIG_DIR / "debug_audio"
+CHAT_IMAGES_DIR = CONFIG_DIR / "chat_images"
 
 LOCAL_MODEL_SIZES = ["tiny", "base", "small", "medium", "large-v3-turbo"]
 
@@ -29,6 +30,10 @@ DEFAULTS = {
     "recording_window_style": "classic",  # "classic", "mini" or "none"
     "recording_window_always_show": False,
     "recording_window_dock": "bottom-2",  # "<edge>-<slot>", see DOCK_EDGES
+    "chat_model": "",  # OpenRouter model id used by the mini chat window
+    "chat_bubble_visible": True,
+    "chat_bubble_dock": "right-2",  # "<edge>-<slot>", see DOCK_EDGES — own key
+                                     # so it doesn't fight the recording overlay
 }
 
 

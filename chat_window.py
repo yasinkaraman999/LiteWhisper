@@ -1,0 +1,701 @@
+"""The ChatGPT-style mini chat window.
+
+Runs independently of Option+Space / Shift+Option+Space dictation — the only
+things it shares with them are the microphone (see mic_lock.py) and the
+OpenRouter API key. Conversations and messages persist via chat_history.py;
+images are copied into config.CHAT_IMAGES_DIR and referenced by path.
+"""
+
+import shutil
+import threading
+import uuid
+from datetime import datetime
+from pathlib import Path
+
+import objc
+import rumps
+from AppKit import (
+    NSApp,
+    NSButton,
+    NSColor,
+    NSEvent,
+    NSEventModifierFlagShift,
+    NSFont,
+    NSImage,
+    NSImageScaleProportionallyUpOrDown,
+    NSImageView,
+    NSMenu,
+    NSMenuItem,
+    NSModalResponseOK,
+    NSOpenPanel,
+    NSPopUpButton,
+    NSScrollView,
+    NSTableCellView,
+    NSTableColumn,
+    NSTableView,
+    NSTextView,
+    NSView,
+    NSWindow,
+    NSWindowStyleMaskClosable,
+    NSWindowStyleMaskMiniaturizable,
+    NSWindowStyleMaskResizable,
+    NSWindowStyleMaskTitled,
+)
+from Foundation import NSIndexSet, NSObject
+from PyObjCTools import AppHelper
+
+import chat_engine
+import chat_history
+import config
+import mic_lock
+import models
+import nsui
+import theme
+from audio_recorder import AudioRecorder
+from transcriber import get_transcriber
+from ui_helpers import ButtonTarget, keep_alive
+
+WINDOW_WIDTH = 720.0
+WINDOW_HEIGHT = 560.0
+SIDEBAR_WIDTH = 200.0
+BUBBLE_MAX_WIDTH = 420.0
+THUMBNAIL_SIZE = 72.0
+INPUT_HEIGHT = 76.0
+MIC_OWNER = "chat"
+IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "gif", "webp"]
+
+_window = None
+_sidebar_table = None
+_sidebar_delegate = None
+_conversations = []  # cached rows from chat_history.list_conversations()
+_current_conversation_id = None
+_message_body = None
+_message_scroll = None
+_model_popup = None
+_available_models = []  # [{"id", "name", "supports_images"}]
+_input_view = None
+_attach_button = None
+_mic_button = None
+_pending_images = []  # local file paths staged for the next send
+_recording = False
+_recorder = None
+
+
+# --------------------------------------------------------------- helpers
+
+
+def _display_title(convo):
+    return convo["title"] or "New Chat"
+
+
+def _parse(raw):
+    try:
+        return datetime.fromisoformat(raw)
+    except (ValueError, TypeError):
+        return None
+
+
+def _icon_button(symbol, callback, tooltip=""):
+    button = nsui.anchor(NSButton.alloc().init())
+    image = NSImage.imageWithSystemSymbolName_accessibilityDescription_(symbol, tooltip)
+    button.setImage_(image)
+    button.setBordered_(False)
+    button.setToolTip_(tooltip)
+    target = ButtonTarget.alloc().initWithCallback_(lambda _sender: callback())
+    keep_alive(target)
+    button.setTarget_(target)
+    button.setAction_("clicked:")
+    nsui.activate([
+        button.widthAnchor().constraintEqualToConstant_(28.0),
+        button.heightAnchor().constraintEqualToConstant_(28.0),
+    ])
+    return button
+
+
+# ------------------------------------------------------------- AppKit glue
+
+
+class SidebarDelegate(NSObject):
+    """Data source, delegate and context-menu target for the conversation
+    list, combined — there's only ever one sidebar, so one small class
+    covers all three protocols."""
+
+    def numberOfRowsInTableView_(self, table_view):
+        return len(_conversations)
+
+    def tableView_viewForTableColumn_row_(self, table_view, column, row):
+        convo = _conversations[row]
+        cell = NSTableCellView.alloc().init()
+        text_field = nsui.label(_display_title(convo), size=12.0)
+        cell.addSubview_(text_field)
+        cell.setTextField_(text_field)
+        nsui.activate([
+            text_field.leadingAnchor().constraintEqualToAnchor_constant_(
+                cell.leadingAnchor(), 6.0
+            ),
+            text_field.trailingAnchor().constraintLessThanOrEqualToAnchor_constant_(
+                cell.trailingAnchor(), -6.0
+            ),
+            text_field.centerYAnchor().constraintEqualToAnchor_(cell.centerYAnchor()),
+        ])
+        return cell
+
+    def tableViewSelectionDidChange_(self, notification):
+        row = _sidebar_table.selectedRow()
+        if 0 <= row < len(_conversations):
+            _select_conversation(_conversations[row]["id"])
+
+    def deleteSelected_(self, sender):
+        row = _sidebar_table.clickedRow()
+        if 0 <= row < len(_conversations):
+            _on_delete_conversation(_conversations[row]["id"])
+
+
+class InputDelegate(NSObject):
+    """Catches Return in the message text view: sends the message unless
+    Shift is held, in which case a plain newline is inserted as usual."""
+
+    def initWithCallback_(self, callback):
+        self = objc.super(InputDelegate, self).init()
+        if self is None:
+            return None
+        self._callback = callback
+        return self
+
+    def textView_doCommandBySelector_(self, text_view, selector):
+        if selector == "insertNewline:":
+            shift_held = bool(NSEvent.modifierFlags() & NSEventModifierFlagShift)
+            if not shift_held:
+                self._callback()
+                return True
+        return False
+
+
+# --------------------------------------------------------------- building
+
+
+def _build_sidebar():
+    global _sidebar_table, _sidebar_delegate
+
+    _sidebar_delegate = SidebarDelegate.alloc().init()
+    keep_alive(_sidebar_delegate)
+
+    container = nsui.anchor(NSView.alloc().init())
+
+    new_chat = nsui.button("New Chat", _on_new_chat)
+
+    table = NSTableView.alloc().init()
+    table.setHeaderView_(None)
+    table.setRowHeight_(28.0)
+    table.setAllowsEmptySelection_(True)
+    table.setAllowsMultipleSelection_(False)
+    table.setBackgroundColor_(NSColor.clearColor())
+    column = NSTableColumn.alloc().initWithIdentifier_("conversation")
+    table.addTableColumn_(column)
+    table.setDataSource_(_sidebar_delegate)
+    table.setDelegate_(_sidebar_delegate)
+
+    menu = NSMenu.alloc().init()
+    delete_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+        "Delete", "deleteSelected:", ""
+    )
+    delete_item.setTarget_(_sidebar_delegate)
+    menu.addItem_(delete_item)
+    table.setMenu_(menu)
+
+    scroll = nsui.anchor(NSScrollView.alloc().init())
+    scroll.setDrawsBackground_(False)
+    scroll.setHasVerticalScroller_(True)
+    scroll.setAutohidesScrollers_(True)
+    scroll.setDocumentView_(table)
+
+    container.addSubview_(new_chat)
+    container.addSubview_(scroll)
+
+    nsui.activate([
+        new_chat.topAnchor().constraintEqualToAnchor_constant_(
+            container.safeAreaLayoutGuide().topAnchor(), 10.0
+        ),
+        new_chat.leadingAnchor().constraintEqualToAnchor_constant_(container.leadingAnchor(), 10.0),
+        new_chat.trailingAnchor().constraintEqualToAnchor_constant_(container.trailingAnchor(), -10.0),
+
+        scroll.topAnchor().constraintEqualToAnchor_constant_(new_chat.bottomAnchor(), 8.0),
+        scroll.leadingAnchor().constraintEqualToAnchor_(container.leadingAnchor()),
+        scroll.trailingAnchor().constraintEqualToAnchor_(container.trailingAnchor()),
+        scroll.bottomAnchor().constraintEqualToAnchor_(container.bottomAnchor()),
+    ])
+
+    _sidebar_table = table
+    return container
+
+
+def _build_model_row():
+    global _model_popup
+
+    _model_popup = nsui.anchor(NSPopUpButton.alloc().init())
+    _model_popup.setPullsDown_(False)
+    refresh = nsui.button("Refresh", _on_refresh_chat_models)
+
+    row = nsui.anchor(NSView.alloc().init())
+    row.addSubview_(_model_popup)
+    row.addSubview_(refresh)
+
+    nsui.activate([
+        _model_popup.leadingAnchor().constraintEqualToAnchor_constant_(row.leadingAnchor(), 12.0),
+        _model_popup.topAnchor().constraintEqualToAnchor_constant_(row.topAnchor(), 8.0),
+        _model_popup.bottomAnchor().constraintEqualToAnchor_constant_(row.bottomAnchor(), -8.0),
+
+        refresh.leadingAnchor().constraintEqualToAnchor_constant_(_model_popup.trailingAnchor(), 8.0),
+        refresh.centerYAnchor().constraintEqualToAnchor_(_model_popup.centerYAnchor()),
+        refresh.trailingAnchor().constraintLessThanOrEqualToAnchor_constant_(row.trailingAnchor(), -12.0),
+    ])
+    return row
+
+
+def _build_input_row():
+    global _input_view, _attach_button, _mic_button
+
+    _attach_button = _icon_button("paperclip", _on_attach_image, tooltip="Attach image")
+    _mic_button = _icon_button("mic.fill", _on_mic_clicked, tooltip="Dictate")
+    send_button = _icon_button("arrow.up.circle.fill", _on_send, tooltip="Send")
+
+    _input_view = NSTextView.alloc().init()
+    _input_view.setFont_(NSFont.systemFontOfSize_(13.0))
+    _input_view.setRichText_(False)
+    _input_view.setAutomaticQuoteSubstitutionEnabled_(False)
+    delegate = InputDelegate.alloc().initWithCallback_(_on_send)
+    keep_alive(delegate)
+    _input_view.setDelegate_(delegate)
+
+    input_scroll = nsui.anchor(NSScrollView.alloc().init())
+    input_scroll.setHasVerticalScroller_(True)
+    input_scroll.setDocumentView_(_input_view)
+
+    row = nsui.anchor(NSView.alloc().init())
+    for view in (_attach_button, _mic_button, input_scroll, send_button):
+        row.addSubview_(view)
+
+    nsui.activate([
+        _attach_button.leadingAnchor().constraintEqualToAnchor_constant_(row.leadingAnchor(), 10.0),
+        _attach_button.centerYAnchor().constraintEqualToAnchor_(row.centerYAnchor()),
+
+        _mic_button.leadingAnchor().constraintEqualToAnchor_constant_(_attach_button.trailingAnchor(), 4.0),
+        _mic_button.centerYAnchor().constraintEqualToAnchor_(row.centerYAnchor()),
+
+        input_scroll.leadingAnchor().constraintEqualToAnchor_constant_(_mic_button.trailingAnchor(), 8.0),
+        input_scroll.topAnchor().constraintEqualToAnchor_constant_(row.topAnchor(), 10.0),
+        input_scroll.bottomAnchor().constraintEqualToAnchor_constant_(row.bottomAnchor(), -10.0),
+
+        send_button.leadingAnchor().constraintEqualToAnchor_constant_(input_scroll.trailingAnchor(), 8.0),
+        send_button.trailingAnchor().constraintEqualToAnchor_constant_(row.trailingAnchor(), -10.0),
+        send_button.centerYAnchor().constraintEqualToAnchor_(row.centerYAnchor()),
+    ])
+    return row
+
+
+def _build_main_pane():
+    global _message_scroll, _message_body
+
+    model_row = _build_model_row()
+    _message_scroll, _message_body = nsui.scroll_body([], spacing=10.0)
+    input_row = _build_input_row()
+
+    container = nsui.anchor(NSView.alloc().init())
+    container.addSubview_(model_row)
+    container.addSubview_(_message_scroll)
+    container.addSubview_(input_row)
+
+    nsui.activate([
+        model_row.topAnchor().constraintEqualToAnchor_(container.safeAreaLayoutGuide().topAnchor()),
+        model_row.leadingAnchor().constraintEqualToAnchor_(container.leadingAnchor()),
+        model_row.trailingAnchor().constraintEqualToAnchor_(container.trailingAnchor()),
+
+        _message_scroll.topAnchor().constraintEqualToAnchor_(model_row.bottomAnchor()),
+        _message_scroll.leadingAnchor().constraintEqualToAnchor_(container.leadingAnchor()),
+        _message_scroll.trailingAnchor().constraintEqualToAnchor_(container.trailingAnchor()),
+        _message_scroll.bottomAnchor().constraintEqualToAnchor_(input_row.topAnchor()),
+
+        input_row.leadingAnchor().constraintEqualToAnchor_(container.leadingAnchor()),
+        input_row.trailingAnchor().constraintEqualToAnchor_(container.trailingAnchor()),
+        input_row.bottomAnchor().constraintEqualToAnchor_(container.bottomAnchor()),
+        input_row.heightAnchor().constraintEqualToConstant_(INPUT_HEIGHT),
+    ])
+    return container
+
+
+def _build_window():
+    window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+        ((0, 0), (WINDOW_WIDTH, WINDOW_HEIGHT)),
+        NSWindowStyleMaskTitled
+        | NSWindowStyleMaskClosable
+        | NSWindowStyleMaskMiniaturizable
+        | NSWindowStyleMaskResizable,
+        2,
+        False,
+    )
+    window.setTitle_("Chat")
+    window.setReleasedWhenClosed_(False)
+    window.setMinSize_((520, 380))
+
+    root = nsui.anchor(NSView.alloc().init())
+    window.setContentView_(root)
+
+    sidebar = _build_sidebar()
+    main_pane = _build_main_pane()
+    root.addSubview_(sidebar)
+    root.addSubview_(main_pane)
+
+    nsui.activate([
+        sidebar.topAnchor().constraintEqualToAnchor_(root.topAnchor()),
+        sidebar.bottomAnchor().constraintEqualToAnchor_(root.bottomAnchor()),
+        sidebar.leadingAnchor().constraintEqualToAnchor_(root.leadingAnchor()),
+        sidebar.widthAnchor().constraintEqualToConstant_(SIDEBAR_WIDTH),
+
+        main_pane.topAnchor().constraintEqualToAnchor_(root.topAnchor()),
+        main_pane.bottomAnchor().constraintEqualToAnchor_(root.bottomAnchor()),
+        main_pane.leadingAnchor().constraintEqualToAnchor_(sidebar.trailingAnchor()),
+        main_pane.trailingAnchor().constraintEqualToAnchor_(root.trailingAnchor()),
+    ])
+
+    window.center()
+    return window
+
+
+# --------------------------------------------------------------- messages
+
+
+def _empty_state():
+    return nsui.section(None, [
+        nsui.row(
+            "No messages yet",
+            subtitle="Ask a quick question, or dictate one with the mic button.",
+        ),
+    ])
+
+
+def _thumbnail(path):
+    view = nsui.anchor(NSImageView.alloc().init())
+    image = NSImage.alloc().initWithContentsOfFile_(str(path))
+    if image is not None:
+        view.setImage_(image)
+    view.setImageScaling_(NSImageScaleProportionallyUpOrDown)
+    nsui.activate([
+        view.widthAnchor().constraintEqualToConstant_(THUMBNAIL_SIZE),
+        view.heightAnchor().constraintEqualToConstant_(THUMBNAIL_SIZE),
+    ])
+    return view
+
+
+def _aligned_row(inner, is_user):
+    """Wraps `inner` in a full-width row, pinned to the leading edge for
+    assistant messages or the trailing edge for the user's own — the
+    iMessage-style alignment that tells the two apart at a glance."""
+    row = nsui.anchor(NSView.alloc().init())
+    row.addSubview_(inner)
+    if is_user:
+        edge = inner.trailingAnchor().constraintEqualToAnchor_(row.trailingAnchor())
+        other = inner.leadingAnchor().constraintGreaterThanOrEqualToAnchor_(row.leadingAnchor())
+    else:
+        edge = inner.leadingAnchor().constraintEqualToAnchor_(row.leadingAnchor())
+        other = inner.trailingAnchor().constraintLessThanOrEqualToAnchor_(row.trailingAnchor())
+    nsui.activate([
+        edge,
+        other,
+        inner.topAnchor().constraintEqualToAnchor_(row.topAnchor()),
+        inner.bottomAnchor().constraintEqualToAnchor_(row.bottomAnchor()),
+    ])
+    return row
+
+
+def _text_row(message, is_user):
+    when = _parse(message["created_at"])
+    meta = when.strftime("%H:%M") if when else ""
+    tint = NSColor.controlAccentColor().colorWithAlphaComponent_(0.18) if is_user else theme.GROUP_FILL
+    box = nsui.bubble(message["text"], meta=meta, tint=tint)
+    nsui.activate([box.widthAnchor().constraintLessThanOrEqualToConstant_(BUBBLE_MAX_WIDTH)])
+    return _aligned_row(box, is_user)
+
+
+def _image_row(image_paths, is_user):
+    thumbs = nsui.hstack_control([_thumbnail(p) for p in image_paths], spacing=6.0)
+    return _aligned_row(thumbs, is_user)
+
+
+def _refresh_messages():
+    if _message_body is None:
+        return
+    if _current_conversation_id is None:
+        nsui.set_arranged(_message_body, [_empty_state()])
+        return
+
+    messages = chat_history.load_messages(_current_conversation_id)
+    if not messages:
+        nsui.set_arranged(_message_body, [_empty_state()])
+        return
+
+    views = []
+    for message in messages:
+        is_user = message["role"] == "user"
+        if message.get("image_paths"):
+            views.append(_image_row(message["image_paths"], is_user))
+        if message.get("text"):
+            views.append(_text_row(message, is_user))
+    nsui.set_arranged(_message_body, views)
+
+    if views:
+        AppHelper.callAfter(views[-1].scrollRectToVisible_, views[-1].bounds())
+
+
+# ---------------------------------------------------------- conversations
+
+
+def _refresh_sidebar(select_id=None):
+    global _conversations
+    _conversations = chat_history.list_conversations()
+    if _sidebar_table is not None:
+        _sidebar_table.reloadData()
+    target = select_id if select_id is not None else _current_conversation_id
+    _select_row_for(target)
+
+
+def _select_row_for(conversation_id):
+    if _sidebar_table is None:
+        return
+    for i, convo in enumerate(_conversations):
+        if convo["id"] == conversation_id:
+            _sidebar_table.selectRowIndexes_byExtendingSelection_(
+                NSIndexSet.indexSetWithIndex_(i), False
+            )
+            return
+
+
+def _select_conversation(conversation_id):
+    global _current_conversation_id
+    if conversation_id == _current_conversation_id:
+        return
+    _current_conversation_id = conversation_id
+    _refresh_messages()
+    convo = next((c for c in _conversations if c["id"] == conversation_id), None)
+    if convo is not None:
+        _populate_chat_model_popup(convo.get("model") or config.load()["chat_model"])
+
+
+def _on_new_chat():
+    cfg = config.load()
+    conversation_id = chat_history.create_conversation(model=cfg["chat_model"])
+    _refresh_sidebar(select_id=conversation_id)
+    global _current_conversation_id
+    _current_conversation_id = conversation_id
+    _refresh_messages()
+
+
+def _on_delete_conversation(conversation_id):
+    global _current_conversation_id
+    chat_history.delete_conversation(conversation_id)
+    if _current_conversation_id == conversation_id:
+        _current_conversation_id = None
+    _refresh_sidebar()
+    _refresh_messages()
+
+
+# --------------------------------------------------------------- models
+
+
+def _populate_chat_model_popup(selected_id):
+    _model_popup.removeAllItems()
+    for m in _available_models:
+        badge = " 🖼" if m.get("supports_images") else ""
+        _model_popup.addItemWithTitle_(f"{m['name']}{badge}  —  {m['id']}")
+    ids = [m["id"] for m in _available_models]
+    if selected_id in ids:
+        _model_popup.selectItemAtIndex_(ids.index(selected_id))
+    elif selected_id:
+        _model_popup.addItemWithTitle_(selected_id)
+        _model_popup.selectItemAtIndex_(_model_popup.numberOfItems() - 1)
+
+
+def _current_model_id():
+    index = _model_popup.indexOfSelectedItem()
+    if 0 <= index < len(_available_models):
+        return _available_models[index]["id"]
+    return None
+
+
+def _on_refresh_chat_models():
+    api_key = config.load()["openrouter_api_key"]
+    if not api_key:
+        return
+
+    def fetch():
+        try:
+            fetched = models.fetch_chat_models(api_key)
+        except Exception:
+            return
+
+        def apply():
+            global _available_models
+            _available_models = fetched
+            selected = _current_model_id() or config.load()["chat_model"]
+            _populate_chat_model_popup(selected)
+
+        AppHelper.callAfter(apply)
+
+    threading.Thread(target=fetch, daemon=True).start()
+
+
+# ---------------------------------------------------------------- images
+
+
+def _persist_image(source_path):
+    try:
+        config.CHAT_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+        ext = Path(source_path).suffix or ".png"
+        dest = config.CHAT_IMAGES_DIR / f"{uuid.uuid4().hex}{ext}"
+        shutil.copy(source_path, dest)
+        return str(dest)
+    except OSError:
+        return None
+
+
+def _on_attach_image():
+    panel = NSOpenPanel.openPanel()
+    panel.setCanChooseFiles_(True)
+    panel.setCanChooseDirectories_(False)
+    panel.setAllowsMultipleSelection_(True)
+    panel.setAllowedFileTypes_(IMAGE_EXTENSIONS)
+    if panel.runModal() != NSModalResponseOK:
+        return
+    for url in panel.URLs():
+        path = url.path()
+        if path:
+            _pending_images.append(path)
+    _attach_button.setToolTip_(f"{len(_pending_images)} image(s) attached")
+
+
+# ------------------------------------------------------------------- mic
+
+
+def _on_mic_clicked():
+    global _recording, _recorder
+    if _recording:
+        _stop_chat_recording()
+        return
+    if not mic_lock.acquire(MIC_OWNER):
+        rumps.notification("lite-whisper", "", "Microphone is busy")
+        return
+    _recorder = AudioRecorder()
+    _recorder.start()
+    _recording = True
+    _mic_button.setContentTintColor_(NSColor.systemRedColor())
+
+
+def _stop_chat_recording():
+    global _recording
+    recorder = _recorder
+    wav_bytes = recorder.stop()
+    _recording = False
+    _mic_button.setContentTintColor_(None)
+    mic_lock.release(MIC_OWNER)
+
+    def transcribe():
+        try:
+            if not wav_bytes or not recorder.last_had_speech:
+                return
+            cfg = config.load()
+            transcriber = get_transcriber(
+                engine=cfg["engine"],
+                model=cfg["model"],
+                local_model_size=cfg["local_model_size"],
+                api_key=cfg["openrouter_api_key"],
+            )
+            text = transcriber.transcribe(wav_bytes).strip()
+        except Exception:
+            return
+        if text:
+            AppHelper.callAfter(_insert_dictated_text, text)
+
+    threading.Thread(target=transcribe, daemon=True).start()
+
+
+def _insert_dictated_text(text):
+    current = str(_input_view.string())
+    separator = " " if current and not current.endswith(" ") else ""
+    _input_view.setString_(current + separator + text)
+
+
+# ---------------------------------------------------------------- send
+
+
+def _on_send():
+    global _pending_images
+
+    if _current_conversation_id is None:
+        _on_new_chat()
+    conversation_id = _current_conversation_id
+
+    text = str(_input_view.string()).strip()
+    images = list(_pending_images)
+    if not text and not images:
+        return
+
+    cfg = config.load()
+    model = _current_model_id() or cfg["chat_model"]
+    if not model:
+        rumps.notification("lite-whisper", "Chat", "Pick a model first")
+        return
+
+    stored_images = [p for p in (_persist_image(p) for p in images) if p is not None]
+
+    is_first_message = len(chat_history.load_messages(conversation_id)) == 0
+    chat_history.append_message(conversation_id, "user", text, image_paths=stored_images)
+    if is_first_message:
+        chat_history.rename_conversation(conversation_id, text[:40] if text else "Image")
+    chat_history.set_conversation_model(conversation_id, model)
+
+    _input_view.setString_("")
+    _pending_images = []
+    _attach_button.setToolTip_("Attach image")
+    _refresh_sidebar(select_id=conversation_id)
+    _refresh_messages()
+
+    history_for_api = [
+        {"role": m["role"], "text": m["text"], "image_paths": m["image_paths"]}
+        for m in chat_history.load_messages(conversation_id)
+    ]
+
+    def call_api():
+        try:
+            reply = chat_engine.send(history_for_api, model, cfg["openrouter_api_key"])
+        except Exception as e:
+            AppHelper.callAfter(
+                rumps.notification, "lite-whisper", "Chat error", str(e)
+            )
+            return
+
+        def on_done():
+            chat_history.append_message(conversation_id, "assistant", reply)
+            if conversation_id == _current_conversation_id:
+                _refresh_messages()
+            _refresh_sidebar()
+
+        AppHelper.callAfter(on_done)
+
+    threading.Thread(target=call_api, daemon=True).start()
+
+
+# -------------------------------------------------------------------- API
+
+
+def show():
+    global _window
+    if _window is None:
+        _window = _build_window()
+        _refresh_sidebar()
+        _on_refresh_chat_models()
+        if _conversations:
+            _select_conversation(_conversations[0]["id"])
+        else:
+            _refresh_messages()
+
+    _window.makeKeyAndOrderFront_(None)
+    NSApp.activateIgnoringOtherApps_(True)

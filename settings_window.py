@@ -12,6 +12,7 @@ from AppKit import (
 )
 from PyObjCTools import AppHelper
 
+import chat_bubble
 import config
 import models
 import nsui
@@ -64,6 +65,10 @@ _live_model_popup = None
 _live_status_label = None
 _live_available_models = []  # [{"id": ..., "name": ...}]
 _live_local_popup = None
+_chat_model_popup = None
+_chat_status_label = None
+_chat_available_models = []  # [{"id": ..., "name": ..., "supports_images": ...}]
+_chat_bubble_checkbox = None
 
 
 def _list_input_devices():
@@ -276,6 +281,38 @@ def build_live_page():
     ])
 
 
+def build_chat_page():
+    global _chat_model_popup, _chat_status_label, _chat_bubble_checkbox
+
+    _chat_model_popup = _popup()
+
+    _chat_status_label = nsui.secondary("", size=11.0)
+    _chat_status_label.setAlignment_(NSTextAlignmentRight)
+    nsui.activate([_chat_status_label.widthAnchor().constraintEqualToConstant_(150.0)])
+
+    _chat_bubble_checkbox = nsui.checkbox()
+
+    return nsui.scroll_page([
+        nsui.section("Model", [
+            nsui.row("Chat model", _chat_model_popup),
+            nsui.row("Model list", nsui.hstack_control([
+                _chat_status_label,
+                nsui.button("Refresh", _on_refresh_chat_settings_models),
+            ])),
+        ], footer="Uses the same API key as dictation. Models marked 🖼 "
+                  "support image messages."),
+        nsui.section("Bubble", [
+            nsui.row(
+                "Show floating chat icon",
+                _chat_bubble_checkbox,
+                subtitle="A draggable icon that opens Chat with one click. "
+                         "Chat is always reachable from the menu bar either way.",
+            ),
+        ]),
+        _save_footer(),
+    ])
+
+
 def build_models_page():
     global _active_local_popup
 
@@ -394,6 +431,46 @@ def _on_refresh_live_models():
     threading.Thread(target=fetch, daemon=True).start()
 
 
+def _on_refresh_chat_settings_models():
+    api_key = config.load()["openrouter_api_key"]
+    if not api_key:
+        _chat_status_label.setStringValue_("Enter an API key in Configuration first")
+        return
+
+    _chat_status_label.setStringValue_("Loading...")
+
+    def fetch():
+        try:
+            fetched = models.fetch_chat_models(api_key)
+        except Exception as e:
+            AppHelper.callAfter(_chat_status_label.setStringValue_, f"Error: {e}")
+            return
+
+        def apply():
+            global _chat_available_models
+            _chat_available_models = fetched
+            cfg = config.load()
+            _populate_chat_settings_model_popup(cfg["chat_model"])
+            _chat_status_label.setStringValue_(f"{len(fetched)} models")
+
+        AppHelper.callAfter(apply)
+
+    threading.Thread(target=fetch, daemon=True).start()
+
+
+def _populate_chat_settings_model_popup(selected_id):
+    _chat_model_popup.removeAllItems()
+    for m in _chat_available_models:
+        badge = " 🖼" if m.get("supports_images") else ""
+        _chat_model_popup.addItemWithTitle_(f"{m['name']}{badge}  —  {m['id']}")
+    ids = [m["id"] for m in _chat_available_models]
+    if selected_id in ids:
+        _chat_model_popup.selectItemAtIndex_(ids.index(selected_id))
+    elif selected_id:
+        _chat_model_popup.addItemWithTitle_(selected_id)
+        _chat_model_popup.selectItemAtIndex_(_chat_model_popup.numberOfItems() - 1)
+
+
 def _refresh_local_rows():
     for size, widgets in _local_rows.items():
         if is_downloaded(size, config.LOCAL_MODELS_DIR):
@@ -482,6 +559,12 @@ def _on_save():
         if 0 <= local_index < len(config.LOCAL_MODEL_SIZES):
             cfg["live_local_model_size"] = config.LOCAL_MODEL_SIZES[local_index]
 
+    if _chat_model_popup is not None:
+        selected_index = _chat_model_popup.indexOfSelectedItem()
+        if 0 <= selected_index < len(_chat_available_models):
+            cfg["chat_model"] = _chat_available_models[selected_index]["id"]
+        cfg["chat_bubble_visible"] = bool(_chat_bubble_checkbox.state())
+
     if _input_device_popup is not None:
         device_index = _input_device_popup.indexOfSelectedItem()
         if 0 <= device_index < len(_input_device_ids):
@@ -505,9 +588,10 @@ def _on_save():
 
     config.save(cfg)
 
-    # The overlay reads its style and dock at build time, so it has to be
-    # told to pick the new ones up.
+    # The overlays read their style/visibility/dock at build time, so they
+    # have to be told to pick the new ones up.
     recording_window.refresh_from_config()
+    chat_bubble.refresh_from_config()
 
     if _status_label is not None:
         _status_label.setStringValue_("Saved")
@@ -553,6 +637,15 @@ def refresh_all():
             _live_local_popup.selectItemAtIndex_(
                 config.LOCAL_MODEL_SIZES.index(cfg["live_local_model_size"])
             )
+
+    if _chat_model_popup is not None:
+        _populate_chat_settings_model_popup(cfg["chat_model"])
+        if not _chat_available_models:
+            _chat_model_popup.removeAllItems()
+            if cfg["chat_model"]:
+                _chat_model_popup.addItemWithTitle_(cfg["chat_model"])
+        _chat_status_label.setStringValue_("")
+        _chat_bubble_checkbox.setState_(1 if cfg["chat_bubble_visible"] else 0)
 
     if _input_device_popup is not None:
         if cfg["input_device"] in _input_device_ids:
