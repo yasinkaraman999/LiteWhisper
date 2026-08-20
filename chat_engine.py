@@ -78,10 +78,18 @@ def stream(messages, model, api_key, cancel_event=None):
         raise RuntimeError(f"OpenRouter returned an error ({response.status_code}): {detail}") from e
 
     try:
-        for raw_line in response.iter_lines(decode_unicode=True):
+        # Decoded explicitly as UTF-8 rather than iter_lines(decode_unicode=True):
+        # that relies on response.encoding, which requests defaults to
+        # ISO-8859-1 whenever a server's Content-Type omits a charset —
+        # exactly what text/event-stream responses tend to do — silently
+        # mangling every non-ASCII character (Turkish letters included).
+        for raw_bytes in response.iter_lines():
             if cancel_event is not None and cancel_event.is_set():
                 return
-            if not raw_line or not raw_line.startswith("data: "):
+            if not raw_bytes:
+                continue
+            raw_line = raw_bytes.decode("utf-8", errors="replace")
+            if not raw_line.startswith("data: "):
                 continue
             data = raw_line[len("data: "):]
             if data == "[DONE]":
