@@ -46,11 +46,13 @@ from AppKit import (
 from Foundation import NSIndexSet, NSObject
 
 import app_activation
+import file_transcribe_page
 import history_window
 import home_page
 import nsui
 import permissions_window
 import settings_window
+import theme
 from ui_helpers import WindowCloseObserver, compose_badge_image, keep_alive
 
 SIDEBAR_MIN_WIDTH = 204.0
@@ -74,6 +76,8 @@ NAV_ITEMS = [
      settings_window.build_live_page, settings_window.refresh_all),
     ("chat", "Chat", "bubble.left.and.bubble.right.fill", NSColor.systemPinkColor(),
      settings_window.build_chat_page, settings_window.refresh_all),
+    ("transcribe", "Transcribe File", "doc.text.magnifyingglass", NSColor.systemIndigoColor(),
+     file_transcribe_page.build, None),
     ("models", "Model Library", "books.vertical.fill", NSColor.systemOrangeColor(),
      settings_window.build_models_page, settings_window.refresh_all),
     ("history", "History", "clock.arrow.circlepath", NSColor.systemPurpleColor(),
@@ -83,6 +87,11 @@ NAV_ITEMS = [
 ]
 
 _ITEMS_BY_KEY = {item[0]: item for item in NAV_ITEMS}
+
+# Temporarily unusable from the sidebar — live dictation itself still needs
+# more work before it's ready to expose again. Shown greyed out rather than
+# removed so it's clear it's coming back, not gone.
+DISABLED_KEYS = {"live"}
 
 _window = None
 _sidebar_controller = None
@@ -209,15 +218,18 @@ class SidebarController(NSViewController):
 
     def tableView_viewForTableColumn_row_(self, table_view, column, row):
         key, title, _symbol, _color, _builder, _refresh = self._visible[row]
+        disabled = key in DISABLED_KEYS
 
         cell = NSTableCellView.alloc().init()
 
         image_view = nsui.anchor(NSImageView.alloc().init())
         image_view.setImage_(self._badges[key])
+        if disabled:
+            image_view.setAlphaValue_(0.35)
         cell.addSubview_(image_view)
         cell.setImageView_(image_view)
 
-        text_field = nsui.label(title)
+        text_field = nsui.label(title, color=theme.TEXT_TERTIARY if disabled else None)
         cell.addSubview_(text_field)
         # Handing AppKit the text field is what makes it recolor the label
         # when the row is selected, instead of it staying dark on the
@@ -240,6 +252,11 @@ class SidebarController(NSViewController):
             text_field.centerYAnchor().constraintEqualToAnchor_(cell.centerYAnchor()),
         ])
         return cell
+
+    def tableView_shouldSelectRow_(self, table_view, row):
+        if 0 <= row < len(self._visible) and self._visible[row][0] in DISABLED_KEYS:
+            return False
+        return True
 
     def tableViewSelectionDidChange_(self, notification):
         key = self.selected_key()
@@ -374,7 +391,7 @@ def _page_controller(key):
 
 
 def show_page(key):
-    if key not in _ITEMS_BY_KEY or _content_controller is None:
+    if key not in _ITEMS_BY_KEY or key in DISABLED_KEYS or _content_controller is None:
         return
     _content_controller.show_page(_page_controller(key))
     if _window is not None:

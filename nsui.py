@@ -283,7 +283,7 @@ BUBBLE_PADDING_X = 12.0
 BUBBLE_PADDING_Y = 9.0
 
 
-def bubble(text, meta=None, tint=None, trailing_gutter=0.0):
+def bubble(text, meta=None, tint=None, trailing_gutter=0.0, size=13.0):
     """A rounded message bubble: text on top, an optional small secondary
     meta line below it, right-aligned. Shared shape for any chat-style UI
     (transcription history, the chat window) — callers position/align the
@@ -292,7 +292,7 @@ def bubble(text, meta=None, tint=None, trailing_gutter=0.0):
     `trailing_gutter` reserves extra space on the right of the text, e.g.
     for a hover-revealed button drawn over the bubble by the caller.
     """
-    text_field = label(text, size=13.0, multiline=True)
+    text_field = label(text, size=size, multiline=True)
     text_field.setSelectable_(True)
 
     content = anchor(NSView.alloc().init())

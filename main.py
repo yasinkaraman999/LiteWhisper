@@ -1,6 +1,7 @@
 import threading
 
 import rumps
+from AppKit import NSApplication, NSMenu, NSMenuItem
 from PyObjCTools import AppHelper
 
 import chat_bubble
@@ -27,11 +28,54 @@ STATE_BUSY = " …"
 APP_ICON = resource_path("logos/lite-whisper-no-bg-colored.png")
 
 
+def _install_edit_menu():
+    """Cmd+C/Cmd+X/Cmd+V/Cmd+A (and a text field's right-click Cut/Copy/
+    Paste) route through AppKit's key-equivalent/validation system, which
+    matches against menu items in NSApp.mainMenu — it isn't wired directly
+    into NSTextView's own key handling. rumps (an LSUIElement/accessory
+    app, so this never shows as a visible menu bar) never sets a main menu
+    at all, so every text field in every one of this app's own windows
+    (chat input, the API key field in Settings, ...) had no Cut/Copy/Paste/
+    Select All to route to — from the user's side that looks exactly like
+    "copy and paste don't work here." The fix doesn't need to be visible:
+    setting NSApp.mainMenu with standard actions (target nil, so each
+    routes to whatever the first responder is) is enough on its own.
+    """
+    # Deliberately no App/Quit menu item here: rumps already owns Quit
+    # (wired to its own quit_application, which stops the hotkey listener
+    # first) — a Cmd+Q bound to NSApplication's plain terminate: would
+    # bypass that cleanup.
+    main_menu = NSMenu.alloc().init()
+
+    edit_menu_item = NSMenuItem.alloc().init()
+    main_menu.addItem_(edit_menu_item)
+    edit_menu = NSMenu.alloc().initWithTitle_("Edit")
+    edit_menu_item.setSubmenu_(edit_menu)
+
+    for title, selector, key in [
+        ("Cut", "cut:", "x"),
+        ("Copy", "copy:", "c"),
+        ("Paste", "paste:", "v"),
+        ("Select All", "selectAll:", "a"),
+    ]:
+        edit_menu.addItem_(
+            NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, selector, key)
+        )
+
+    # NSApp (the PyObjC global proxy) is only live once the shared
+    # NSApplication instance exists — rumps.App.__init__ doesn't create it
+    # synchronously, so referencing NSApp here (rather than fetching the
+    # instance explicitly) crashed the packaged app on launch with
+    # AttributeError: 'NoneType' object has no attribute 'setMainMenu_'.
+    NSApplication.sharedApplication().setMainMenu_(main_menu)
+
+
 class LiteWhisperApp(rumps.App):
     def __init__(self):
         super().__init__(
             "lite-whisper", title=STATE_IDLE, icon=APP_ICON, template=True, quit_button=None
         )
+        _install_edit_menu()
         self.record_item = rumps.MenuItem("Start Recording", callback=self.on_toggle)
         self.menu = [
             self.record_item,
@@ -50,7 +94,7 @@ class LiteWhisperApp(rumps.App):
             level_source=lambda: self.recorder.level,
             live_stop_callback=self.on_live_toggle,
         )
-        chat_bubble.configure(on_click=chat_window.show)
+        chat_bubble.configure(on_click=chat_window.toggle)
         self._overlay_state("idle")
         self._listener = hotkey.start_listener(
             self.on_toggle,

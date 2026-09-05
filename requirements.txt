@@ -4,6 +4,7 @@ sounddevice
 numpy
 requests
 pyobjc-framework-AVFoundation
+pyobjc-framework-WebKit
 faster-whisper
 noisereduce
 scipy

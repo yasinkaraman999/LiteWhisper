@@ -14,6 +14,7 @@ from PyObjCTools import AppHelper
 
 import chat_bubble
 import config
+import model_picker
 import models
 import nsui
 import recording_window
@@ -44,7 +45,7 @@ DOCK_EDGE_OPTIONS = [
 ]
 
 _api_key_field = None
-_model_popup = None
+_model_picker = None
 _status_label = None
 _available_models = []  # [{"id": ..., "name": ...}]
 _engine_popup = None
@@ -62,13 +63,13 @@ _overlay_always_checkbox = None
 _dock_edge_popup = None
 _dock_slot_popup = None
 _live_engine_popup = None
-_live_model_popup = None
+_live_model_picker = None
 _live_status_label = None
 _live_available_models = []  # [{"id": ..., "name": ...}]
 _live_local_popup = None
 _live_cloud_section_view = None
 _live_local_section_view = None
-_chat_model_popup = None
+_chat_model_picker = None
 _chat_status_label = None
 _chat_available_models = []  # [{"id": ..., "name": ..., "supports_images": ...}]
 _chat_bubble_checkbox = None
@@ -122,7 +123,7 @@ def _secure_text_field(placeholder):
 
 
 def build_configuration_page():
-    global _api_key_field, _engine_popup, _model_popup, _status_label, _cloud_section_view
+    global _api_key_field, _engine_popup, _model_picker, _status_label, _cloud_section_view
 
     _api_key_field = _secure_text_field("sk-or-v1-…")
 
@@ -131,7 +132,7 @@ def build_configuration_page():
         _engine_popup.addItemWithTitle_(label_text)
     _wire_popup(_engine_popup, _on_engine_changed)
 
-    _model_popup = _popup()
+    _model_picker = model_picker.ModelPicker()
 
     _status_label = nsui.secondary("", size=11.0)
     _status_label.setAlignment_(NSTextAlignmentRight)
@@ -144,7 +145,7 @@ def build_configuration_page():
 
     _cloud_section_view = nsui.section("OpenRouter", [
         nsui.row("API key", _api_key_field, stretch=True),
-        nsui.row("Cloud model", _model_popup),
+        nsui.row("Cloud model", _model_picker.view),
         nsui.row("Model list", nsui.hstack_control([
             _status_label,
             nsui.button("Refresh", _on_refresh_models),
@@ -255,7 +256,7 @@ def build_overlay_page():
 
 
 def build_live_page():
-    global _live_engine_popup, _live_model_popup, _live_status_label, _live_local_popup
+    global _live_engine_popup, _live_model_picker, _live_status_label, _live_local_popup
     global _live_cloud_section_view, _live_local_section_view
 
     _live_engine_popup = _popup()
@@ -263,7 +264,7 @@ def build_live_page():
         _live_engine_popup.addItemWithTitle_(label_text)
     _wire_popup(_live_engine_popup, _on_live_engine_changed)
 
-    _live_model_popup = _popup()
+    _live_model_picker = model_picker.ModelPicker()
 
     _live_status_label = nsui.secondary("", size=11.0)
     _live_status_label.setAlignment_(NSTextAlignmentRight)
@@ -281,7 +282,7 @@ def build_live_page():
               "dictation.")
 
     _live_cloud_section_view = nsui.section("OpenRouter", [
-        nsui.row("Cloud model", _live_model_popup),
+        nsui.row("Cloud model", _live_model_picker.view),
         nsui.row("Model list", nsui.hstack_control([
             _live_status_label,
             nsui.button("Refresh", _on_refresh_live_models),
@@ -310,9 +311,9 @@ def build_live_page():
 
 
 def build_chat_page():
-    global _chat_model_popup, _chat_status_label, _chat_bubble_checkbox
+    global _chat_model_picker, _chat_status_label, _chat_bubble_checkbox
 
-    _chat_model_popup = _popup()
+    _chat_model_picker = model_picker.ModelPicker()
 
     _chat_status_label = nsui.secondary("", size=11.0)
     _chat_status_label.setAlignment_(NSTextAlignmentRight)
@@ -326,7 +327,7 @@ def build_chat_page():
 
     return nsui.scroll_page([
         nsui.section("Model", [
-            nsui.row("Chat model", _chat_model_popup),
+            nsui.row("Chat model", _chat_model_picker.view),
             nsui.row("Model list", nsui.hstack_control([
                 _chat_status_label,
                 nsui.button("Refresh", _on_refresh_chat_settings_models),
@@ -429,16 +430,6 @@ def _on_live_engine_changed():
         _live_local_section_view.setHidden_(engine != "local")
 
 
-def _populate_model_popup(popup, models_list, selected_id):
-    popup.removeAllItems()
-    for m in models_list:
-        popup.addItemWithTitle_(f"{m['name']}  —  {m['id']}")
-
-    ids = [m["id"] for m in models_list]
-    if selected_id in ids:
-        popup.selectItemAtIndex_(ids.index(selected_id))
-
-
 def _on_refresh_models():
     api_key = _api_key_field.stringValue().strip()
     if not api_key:
@@ -458,7 +449,8 @@ def _on_refresh_models():
             global _available_models
             _available_models = fetched
             cfg = config.load()
-            _populate_model_popup(_model_popup, fetched, cfg["model"])
+            _model_picker.set_models(fetched)
+            _model_picker.select(cfg["model"])
             _status_label.setStringValue_(f"{len(fetched)} models")
 
         AppHelper.callAfter(apply)
@@ -485,7 +477,8 @@ def _on_refresh_live_models():
             global _live_available_models
             _live_available_models = fetched
             cfg = config.load()
-            _populate_model_popup(_live_model_popup, fetched, cfg["live_model"])
+            _live_model_picker.set_models(fetched)
+            _live_model_picker.select(cfg["live_model"])
             _live_status_label.setStringValue_(f"{len(fetched)} models")
 
         AppHelper.callAfter(apply)
@@ -512,25 +505,13 @@ def _on_refresh_chat_settings_models():
             global _chat_available_models
             _chat_available_models = fetched
             cfg = config.load()
-            _populate_chat_settings_model_popup(cfg["chat_model"])
+            _chat_model_picker.set_models(fetched)
+            _chat_model_picker.select(cfg["chat_model"])
             _chat_status_label.setStringValue_(f"{len(fetched)} models")
 
         AppHelper.callAfter(apply)
 
     threading.Thread(target=fetch, daemon=True).start()
-
-
-def _populate_chat_settings_model_popup(selected_id):
-    _chat_model_popup.removeAllItems()
-    for m in _chat_available_models:
-        badge = " 🖼" if m.get("supports_images") else ""
-        _chat_model_popup.addItemWithTitle_(f"{m['name']}{badge}  —  {m['id']}")
-    ids = [m["id"] for m in _chat_available_models]
-    if selected_id in ids:
-        _chat_model_popup.selectItemAtIndex_(ids.index(selected_id))
-    elif selected_id:
-        _chat_model_popup.addItemWithTitle_(selected_id)
-        _chat_model_popup.selectItemAtIndex_(_chat_model_popup.numberOfItems() - 1)
 
 
 def _populate_local_size_popup(popup, selected_size):
@@ -630,9 +611,9 @@ def _on_save():
     if _api_key_field is not None:
         cfg["openrouter_api_key"] = _api_key_field.stringValue().strip()
 
-        selected_index = _model_popup.indexOfSelectedItem()
-        if 0 <= selected_index < len(_available_models):
-            cfg["model"] = _available_models[selected_index]["id"]
+        selected_id = _model_picker.selected_id()
+        if selected_id:
+            cfg["model"] = selected_id
 
         engine_index = _engine_popup.indexOfSelectedItem()
         if 0 <= engine_index < len(ENGINE_OPTIONS):
@@ -646,18 +627,18 @@ def _on_save():
         if 0 <= live_engine_index < len(ENGINE_OPTIONS):
             cfg["live_engine"] = ENGINE_OPTIONS[live_engine_index][0]
 
-        selected_index = _live_model_popup.indexOfSelectedItem()
-        if 0 <= selected_index < len(_live_available_models):
-            cfg["live_model"] = _live_available_models[selected_index]["id"]
+        selected_id = _live_model_picker.selected_id()
+        if selected_id:
+            cfg["live_model"] = selected_id
 
         local_index = _live_local_popup.indexOfSelectedItem()
         if 0 <= local_index < len(config.LOCAL_MODEL_SIZES):
             cfg["live_local_model_size"] = config.LOCAL_MODEL_SIZES[local_index]
 
-    if _chat_model_popup is not None:
-        selected_index = _chat_model_popup.indexOfSelectedItem()
-        if 0 <= selected_index < len(_chat_available_models):
-            cfg["chat_model"] = _chat_available_models[selected_index]["id"]
+    if _chat_model_picker is not None:
+        selected_id = _chat_model_picker.selected_id()
+        if selected_id:
+            cfg["chat_model"] = selected_id
         cfg["chat_bubble_visible"] = bool(_chat_bubble_checkbox.state())
 
     if _input_device_popup is not None:
@@ -701,10 +682,8 @@ def refresh_all():
         global _config_auto_refreshed
 
         _api_key_field.setStringValue_(cfg["openrouter_api_key"])
-        _populate_model_popup(_model_popup, _available_models, cfg["model"])
-        if not _available_models:
-            _model_popup.removeAllItems()
-            _model_popup.addItemWithTitle_(cfg["model"])
+        _model_picker.set_models(_available_models)
+        _model_picker.select(cfg["model"])
         _status_label.setStringValue_("")
 
         engine_ids = [e[0] for e in ENGINE_OPTIONS]
@@ -727,11 +706,8 @@ def refresh_all():
             _live_engine_popup.selectItemAtIndex_(engine_ids.index(cfg["live_engine"]))
         _on_live_engine_changed()
 
-        _populate_model_popup(_live_model_popup, _live_available_models, cfg["live_model"])
-        if not _live_available_models:
-            _live_model_popup.removeAllItems()
-            if cfg["live_model"]:
-                _live_model_popup.addItemWithTitle_(cfg["live_model"])
+        _live_model_picker.set_models(_live_available_models)
+        _live_model_picker.select(cfg["live_model"])
         _live_status_label.setStringValue_("")
 
     # Runs whenever either popup exists: it repopulates both (download
@@ -740,12 +716,9 @@ def refresh_all():
     if _active_local_popup is not None or _live_local_popup is not None:
         _refresh_local_rows()
 
-    if _chat_model_popup is not None:
-        _populate_chat_settings_model_popup(cfg["chat_model"])
-        if not _chat_available_models:
-            _chat_model_popup.removeAllItems()
-            if cfg["chat_model"]:
-                _chat_model_popup.addItemWithTitle_(cfg["chat_model"])
+    if _chat_model_picker is not None:
+        _chat_model_picker.set_models(_chat_available_models)
+        _chat_model_picker.select(cfg["chat_model"])
         _chat_status_label.setStringValue_("")
         _chat_bubble_checkbox.setState_(1 if cfg["chat_bubble_visible"] else 0)
 

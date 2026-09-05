@@ -4,8 +4,20 @@ Runs independently of Option+Space / Shift+Option+Space dictation — the only
 things it shares with them are the microphone (see mic_lock.py) and the
 OpenRouter API key. Conversations and messages persist via chat_history.py;
 images are copied into config.CHAT_IMAGES_DIR and referenced by path.
+
+The transcript itself (message list, markdown/code rendering, streaming,
+hover actions) is a local WKWebView loaded from chat_transcript/ — fully
+offline, no network access, driven entirely by the window.LW.* functions in
+chat_transcript/app.js. Everything else (sidebar, model picker, input pill,
+mic/attach/send buttons, window chrome) is native AppKit exactly as before;
+that split is deliberate, see the plan discussed for this round. Rendering
+markdown/code/LaTeX to the standard native apps' fidelity is fundamentally a
+browser-engine problem — reimplementing it in NSAttributedString would be
+far more code for a worse result than handing it to WebKit's own engine.
 """
 
+import base64
+import json
 import shutil
 import threading
 import uuid
@@ -20,15 +32,13 @@ from AppKit import (
     NSBoxCustom,
     NSButton,
     NSColor,
-    NSControlSizeSmall,
     NSEvent,
     NSEventModifierFlagShift,
     NSFont,
     NSFontWeightMedium,
+    NSFontWeightSemibold,
     NSImage,
-    NSImageScaleProportionallyUpOrDown,
     NSImageSymbolConfiguration,
-    NSImageView,
     NSMakeRect,
     NSMenu,
     NSMenuItem,
@@ -36,9 +46,6 @@ from AppKit import (
     NSNoBorder,
     NSNoTitle,
     NSOpenPanel,
-    NSPopUpButton,
-    NSProgressIndicator,
-    NSProgressIndicatorStyleSpinning,
     NSScrollView,
     NSSplitViewController,
     NSSplitViewItem,
@@ -60,19 +67,23 @@ from AppKit import (
     NSWindowStyleMaskTitled,
     NSWindowToolbarStyleUnified,
 )
-from Foundation import NSIndexSet, NSObject
+from Foundation import NSIndexSet, NSObject, NSURL
 from PyObjCTools import AppHelper
+from WebKit import WKUserContentController, WKWebView, WKWebViewConfiguration
 
 import app_activation
+import chat_bubble
 import chat_engine
 import chat_history
 import config
 import mic_lock
+import model_picker
 import models
 import nsui
 import theme
 from audio_recorder import AudioRecorder
 from main_window import ToolbarDelegate
+from resources import resource_path
 from transcriber import get_transcriber
 from ui_helpers import ButtonTarget, WindowCloseObserver, keep_alive
 
@@ -80,24 +91,31 @@ WINDOW_WIDTH = 880.0
 WINDOW_HEIGHT = 640.0
 SIDEBAR_MIN_WIDTH = 180.0
 SIDEBAR_MAX_WIDTH = 260.0
-BUBBLE_MAX_WIDTH = 560.0
-THUMBNAIL_SIZE = 72.0
-INPUT_HEIGHT = 76.0
+INPUT_TEXT_MIN_HEIGHT = 34.0  # roughly one line, matches the icon buttons' own height
+INPUT_TEXT_MAX_HEIGHT = 140.0  # about six lines before the text view scrolls internally
 ICON_BUTTON_SIZE = 34.0
 ICON_GLYPH_POINT_SIZE = 16.0
+SEND_BUTTON_SIZE = 38.0
+SEND_GLYPH_POINT_SIZE = 20.0
 MIC_OWNER = "chat"
 IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "gif", "webp"]
+_MIME_TYPES = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "gif": "image/gif", "webp": "image/webp"}
 
 _window = None
+_webview = None
+_webview_ready = False
+_pending_js = []
+_bridge_handler = None
+_nav_delegate = None
+
 _sidebar_table = None
 _sidebar_delegate = None
 _conversations = []  # cached rows from chat_history.list_conversations()
 _current_conversation_id = None
-_message_body = None
-_message_scroll = None
-_model_popup = None
+_model_picker = None
 _available_models = []  # [{"id", "name", "supports_images"}]
 _input_view = None
+_input_scroll_height = None  # mutable NSLayoutConstraint — see _update_input_height()
 _attach_button = None
 _mic_button = None
 _send_button = None
@@ -109,9 +127,6 @@ _recorder = None
 # input row accepts new input.
 _send_state = "idle"
 _stream_cancel_event = None
-_streaming_row = None
-_streaming_label = None
-_streaming_spinner = None
 
 
 # --------------------------------------------------------------- helpers
@@ -148,13 +163,70 @@ def _icon_button(symbol, callback, tooltip=""):
     return button
 
 
-def _set_icon(button, symbol, tooltip):
+def _set_send_icon(button, symbol, tooltip, fill_color):
+    """The send/stop button renders as a filled, two-tone circle (white
+    glyph on a solid color disc) via SF Symbols' palette rendering, instead
+    of the flat single-color glyph the other input-row icons use — it's the
+    primary action of the whole row and needs to read as one at a glance,
+    the way ChatGPT/Claude's own send buttons do, rather than blending in
+    with attach/mic/model/refresh."""
     image = NSImage.imageWithSystemSymbolName_accessibilityDescription_(symbol, tooltip)
-    configuration = NSImageSymbolConfiguration.configurationWithPointSize_weight_(
-        ICON_GLYPH_POINT_SIZE, NSFontWeightMedium
+    size_configuration = NSImageSymbolConfiguration.configurationWithPointSize_weight_(
+        SEND_GLYPH_POINT_SIZE, NSFontWeightSemibold
     )
+    palette_configuration = NSImageSymbolConfiguration.configurationWithPaletteColors_(
+        [NSColor.whiteColor(), fill_color]
+    )
+    configuration = size_configuration.configurationByApplyingConfiguration_(palette_configuration)
     button.setImage_(image.imageWithSymbolConfiguration_(configuration))
     button.setToolTip_(tooltip)
+
+
+def _build_send_button(callback):
+    button = nsui.anchor(NSButton.alloc().init())
+    button.setBordered_(False)
+    target = ButtonTarget.alloc().initWithCallback_(lambda _sender: callback())
+    keep_alive(target)
+    button.setTarget_(target)
+    button.setAction_("clicked:")
+    nsui.activate([
+        button.widthAnchor().constraintEqualToConstant_(SEND_BUTTON_SIZE),
+        button.heightAnchor().constraintEqualToConstant_(SEND_BUTTON_SIZE),
+    ])
+    _set_send_icon(button, "arrow.up.circle.fill", "Send", NSColor.controlAccentColor())
+    return button
+
+
+def _image_data_uri(path):
+    """Inlines an attached image as a data: URI rather than handing the
+    webview a file:// path — the transcript page and the images in
+    config.CHAT_IMAGES_DIR don't share a directory tree the way the page and
+    its own vendor/ assets do, and inlining sidesteps needing to widen the
+    webview's file read access to cover it."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    ext = Path(path).suffix.lstrip(".").lower()
+    mime = _MIME_TYPES.get(ext, "image/png")
+    return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+
+
+def _message_to_json(message):
+    when = _parse(message.get("created_at"))
+    images = []
+    for p in message.get("image_paths") or []:
+        uri = _image_data_uri(p)
+        if uri:
+            images.append({"data": uri, "name": Path(p).name})
+    return {
+        "id": message["id"],
+        "role": message["role"],
+        "text": message.get("text") or "",
+        "images": images,
+        "time": when.strftime("%H:%M") if when else "",
+    }
 
 
 # ------------------------------------------------------------- AppKit glue
@@ -215,6 +287,47 @@ class InputDelegate(NSObject):
                 return True
         return False
 
+    def textDidChange_(self, notification):
+        _update_input_height()
+
+
+class ChatBridge(NSObject):
+    """Receives window.webkit.messageHandlers.bridge.postMessage() calls
+    from chat_transcript/app.js — the transcript's hover actions (copy is
+    handled entirely on the JS side; regenerate/edit/retry need Python since
+    they touch chat_history and re-call chat_engine)."""
+
+    def userContentController_didReceiveScriptMessage_(self, controller, message):
+        body = message.body()
+        try:
+            msg_type = body.get("type")
+        except AttributeError:
+            return
+
+        if msg_type == "regenerate":
+            _on_regenerate(body.get("id"))
+        elif msg_type == "edit":
+            _on_edit(body.get("id"), body.get("text"))
+        elif msg_type == "retry":
+            _on_retry(body.get("id"))
+        # "feedback" (like/dislike) is intentionally local-only — there's no
+        # backend to send it to, so app.js just toggles its own button state.
+
+
+class ChatWebViewNavDelegate(NSObject):
+    """Flushes any window.LW.* calls made before the page finished loading
+    — evaluateJavaScript_completionHandler_ silently no-ops on a page that
+    hasn't loaded yet, so show()'s initial _refresh_messages() would
+    otherwise be lost."""
+
+    def webView_didFinishNavigation_(self, webview, navigation):
+        global _webview_ready
+        _webview_ready = True
+        pending = list(_pending_js)
+        _pending_js.clear()
+        for js in pending:
+            _webview.evaluateJavaScript_completionHandler_(js, None)
+
 
 class ChatSidebarController(NSViewController):
     """Hosts the conversation list as a real NSSplitViewItem sidebar —
@@ -226,7 +339,7 @@ class ChatSidebarController(NSViewController):
 
 
 class ChatMainController(NSViewController):
-    """Hosts the model row, message list and input row."""
+    """Hosts the model row, message transcript and input row."""
 
     def loadView(self):
         self.setView_(_build_main_pane())
@@ -290,40 +403,26 @@ def _build_sidebar():
     return container
 
 
-def _build_model_row():
-    global _model_popup
-
-    _model_popup = nsui.anchor(NSPopUpButton.alloc().init())
-    _model_popup.setPullsDown_(False)
-    refresh = nsui.button("Refresh", _on_refresh_chat_models)
-
-    row = nsui.anchor(NSView.alloc().init())
-    row.addSubview_(_model_popup)
-    row.addSubview_(refresh)
-
-    nsui.activate([
-        _model_popup.leadingAnchor().constraintEqualToAnchor_constant_(row.leadingAnchor(), 12.0),
-        _model_popup.topAnchor().constraintEqualToAnchor_constant_(row.topAnchor(), 8.0),
-        _model_popup.bottomAnchor().constraintEqualToAnchor_constant_(row.bottomAnchor(), -8.0),
-
-        refresh.leadingAnchor().constraintEqualToAnchor_constant_(_model_popup.trailingAnchor(), 8.0),
-        refresh.centerYAnchor().constraintEqualToAnchor_(_model_popup.centerYAnchor()),
-        refresh.trailingAnchor().constraintLessThanOrEqualToAnchor_constant_(row.trailingAnchor(), -12.0),
-    ])
-    return row
-
-
 def _build_input_row():
-    global _input_view, _attach_button, _mic_button, _send_button
+    global _input_view, _attach_button, _mic_button, _send_button, _model_picker
 
     _attach_button = _icon_button("paperclip", _on_attach_image, tooltip="Attach image")
     _mic_button = _icon_button("mic.fill", _on_mic_clicked, tooltip="Dictate")
-    _send_button = _icon_button("arrow.up.circle.fill", _on_send_button_clicked, tooltip="Send")
+    _send_button = _build_send_button(_on_send_button_clicked)
+
+    # The model picker lives right in the input bar, left of Send — like
+    # Claude/ChatGPT's own compact model switcher — instead of a separate
+    # bar above the transcript. It's per-conversation: picking a model here
+    # saves it onto whichever conversation is currently open (see
+    # _on_model_picker_change), the same conversation.model column a normal
+    # send already writes to.
+    _model_picker = model_picker.ModelPicker(on_change=_on_model_picker_change, compact=True)
+    refresh_button = _icon_button("arrow.clockwise", _on_refresh_chat_models, tooltip="Refresh model list")
 
     # NSTextView as an NSScrollView's documentView is sized the classic
     # autoresizing way, not via Auto Layout constraints on the text view
-    # itself — skipping this configuration is what left the previous
-    # version with a degenerate frame that couldn't actually be typed into.
+    # itself — skipping this configuration is what left an earlier version
+    # with a degenerate frame that couldn't actually be typed into.
     _input_view = NSTextView.alloc().initWithFrame_(NSMakeRect(0, 0, 100, 60))
     _input_view.setMinSize_((0.0, 0.0))
     _input_view.setMaxSize_((1.0e7, 1.0e7))
@@ -351,35 +450,67 @@ def _build_input_row():
     input_scroll.setBorderType_(NSNoBorder)
     input_scroll.setDocumentView_(_input_view)
 
+    global _input_scroll_height
+    _input_scroll_height = input_scroll.heightAnchor().constraintEqualToConstant_(INPUT_TEXT_MIN_HEIGHT)
+    nsui.activate([_input_scroll_height])
+
     # The whole row is one rounded pill (attach + mic + text + send all
     # inside it), the way ChatGPT's own input field is built, rather than
     # icon buttons sitting outside a separately boxed text field.
     row = nsui.anchor(NSBox.alloc().init())
     row.setBoxType_(NSBoxCustom)
     row.setTitlePosition_(NSNoTitle)
-    row.setBorderWidth_(0.0)
+    # A hairline border gives the pill a defined edge against the window
+    # background — with only a fill and no border it read as flatter and
+    # less deliberate in dark mode, where the fill and the page behind it
+    # sit closer in value than they do in light mode.
+    row.setBorderWidth_(1.0)
+    row.setBorderColor_(NSColor.separatorColor())
     row.setCornerRadius_(18.0)
     row.setFillColor_(theme.GROUP_FILL)
     row.setContentViewMargins_((0.0, 0.0))
 
     content = nsui.anchor(NSView.alloc().init())
-    for view in (_attach_button, _mic_button, input_scroll, _send_button):
+    for view in (_attach_button, _mic_button, input_scroll, _model_picker.view, refresh_button, _send_button):
         content.addSubview_(view)
 
+    # Every control's *bottom* edge sits on the same line (content.bottom -
+    # 8, matching input_scroll's own bottom inset below) instead of each
+    # being centered independently — centering the 34pt icon buttons on the
+    # content view's full height while the text view's own line of text
+    # top-aligns inside a separately-sized scroll view is what produced the
+    # few-pixel vertical mismatch between the icons and the typed text.
+    bottom_inset = -8.0
     nsui.activate([
         _attach_button.leadingAnchor().constraintEqualToAnchor_constant_(content.leadingAnchor(), 8.0),
-        _attach_button.centerYAnchor().constraintEqualToAnchor_(content.centerYAnchor()),
+        _attach_button.bottomAnchor().constraintEqualToAnchor_constant_(content.bottomAnchor(), bottom_inset),
 
         _mic_button.leadingAnchor().constraintEqualToAnchor_constant_(_attach_button.trailingAnchor(), 2.0),
-        _mic_button.centerYAnchor().constraintEqualToAnchor_(content.centerYAnchor()),
+        _mic_button.bottomAnchor().constraintEqualToAnchor_constant_(content.bottomAnchor(), bottom_inset),
 
-        input_scroll.leadingAnchor().constraintEqualToAnchor_constant_(_mic_button.trailingAnchor(), 6.0),
+    input_scroll.leadingAnchor().constraintEqualToAnchor_constant_(_mic_button.trailingAnchor(), 6.0),
         input_scroll.topAnchor().constraintEqualToAnchor_constant_(content.topAnchor(), 8.0),
-        input_scroll.bottomAnchor().constraintEqualToAnchor_constant_(content.bottomAnchor(), -8.0),
+        # content's height (and so the whole pill's) is *derived* from this,
+        # not the other way around — _update_input_height() grows/shrinks
+        # this one constraint as you type, instead of the row being a fixed
+        # 76pt box that a multi-line message just scrolls inside of.
+        content.bottomAnchor().constraintEqualToAnchor_constant_(input_scroll.bottomAnchor(), -bottom_inset),
 
-        _send_button.leadingAnchor().constraintEqualToAnchor_constant_(input_scroll.trailingAnchor(), 6.0),
+        _model_picker.view.leadingAnchor().constraintEqualToAnchor_constant_(input_scroll.trailingAnchor(), 8.0),
+        # Centered on the icon buttons' own center line rather than bottom-
+        # aligned like them: the chip is shorter than their 34pt box, so
+        # matching bottoms left it visually hanging low relative to the
+        # buttons' larger, vertically-centered glyphs.
+        _model_picker.view.centerYAnchor().constraintEqualToAnchor_(_attach_button.centerYAnchor()),
+
+        refresh_button.leadingAnchor().constraintEqualToAnchor_constant_(
+            _model_picker.view.trailingAnchor(), 2.0
+        ),
+        refresh_button.bottomAnchor().constraintEqualToAnchor_constant_(content.bottomAnchor(), bottom_inset),
+
+        _send_button.leadingAnchor().constraintEqualToAnchor_constant_(refresh_button.trailingAnchor(), 4.0),
         _send_button.trailingAnchor().constraintEqualToAnchor_constant_(content.trailingAnchor(), -8.0),
-        _send_button.centerYAnchor().constraintEqualToAnchor_(content.centerYAnchor()),
+        _send_button.bottomAnchor().constraintEqualToAnchor_constant_(content.bottomAnchor(), bottom_inset),
     ])
 
     row.setContentView_(content)
@@ -387,32 +518,59 @@ def _build_input_row():
     return row
 
 
-def _build_main_pane():
-    global _message_scroll, _message_body
+def _build_transcript_webview():
+    global _webview, _bridge_handler, _nav_delegate, _webview_ready
 
-    model_row = _build_model_row()
-    _message_scroll, _message_body = nsui.scroll_body([], spacing=10.0)
+    _webview_ready = False
+    _pending_js.clear()
+
+    web_config = WKWebViewConfiguration.alloc().init()
+    controller = WKUserContentController.alloc().init()
+    _bridge_handler = ChatBridge.alloc().init()
+    keep_alive(_bridge_handler)
+    controller.addScriptMessageHandler_name_(_bridge_handler, "bridge")
+    web_config.setUserContentController_(controller)
+
+    webview = nsui.anchor(
+        WKWebView.alloc().initWithFrame_configuration_(NSMakeRect(0, 0, 100, 100), web_config)
+    )
+
+    _nav_delegate = ChatWebViewNavDelegate.alloc().init()
+    keep_alive(_nav_delegate)
+    webview.setNavigationDelegate_(_nav_delegate)
+
+    root = Path(resource_path("chat_transcript"))
+    webview.loadFileURL_allowingReadAccessToURL_(
+        NSURL.fileURLWithPath_(str(root / "index.html")),
+        NSURL.fileURLWithPath_(str(root)),
+    )
+
+    _webview = webview
+    return webview
+
+
+def _build_main_pane():
+    transcript = _build_transcript_webview()
     input_row = _build_input_row()
 
     container = nsui.anchor(NSView.alloc().init())
-    container.addSubview_(model_row)
-    container.addSubview_(_message_scroll)
+    container.addSubview_(transcript)
     container.addSubview_(input_row)
 
     nsui.activate([
-        model_row.topAnchor().constraintEqualToAnchor_(container.safeAreaLayoutGuide().topAnchor()),
-        model_row.leadingAnchor().constraintEqualToAnchor_(container.leadingAnchor()),
-        model_row.trailingAnchor().constraintEqualToAnchor_(container.trailingAnchor()),
-
-        _message_scroll.topAnchor().constraintEqualToAnchor_(model_row.bottomAnchor()),
-        _message_scroll.leadingAnchor().constraintEqualToAnchor_(container.leadingAnchor()),
-        _message_scroll.trailingAnchor().constraintEqualToAnchor_(container.trailingAnchor()),
-        _message_scroll.bottomAnchor().constraintEqualToAnchor_(input_row.topAnchor()),
+        transcript.topAnchor().constraintEqualToAnchor_(container.safeAreaLayoutGuide().topAnchor()),
+        transcript.leadingAnchor().constraintEqualToAnchor_(container.leadingAnchor()),
+        transcript.trailingAnchor().constraintEqualToAnchor_(container.trailingAnchor()),
+        transcript.bottomAnchor().constraintEqualToAnchor_(input_row.topAnchor()),
 
         input_row.leadingAnchor().constraintEqualToAnchor_(container.leadingAnchor()),
         input_row.trailingAnchor().constraintEqualToAnchor_(container.trailingAnchor()),
         input_row.bottomAnchor().constraintEqualToAnchor_(container.bottomAnchor()),
-        input_row.heightAnchor().constraintEqualToConstant_(INPUT_HEIGHT),
+        # No fixed height here — the row's height is now intrinsic, derived
+        # bottom-up from _input_scroll_height (see _build_input_row() and
+        # _update_input_height()). These are just safety rails.
+        input_row.heightAnchor().constraintGreaterThanOrEqualToConstant_(INPUT_TEXT_MIN_HEIGHT + 16.0),
+        input_row.heightAnchor().constraintLessThanOrEqualToConstant_(INPUT_TEXT_MAX_HEIGHT + 16.0),
     ])
     return container
 
@@ -428,6 +586,10 @@ def _build_window():
     sidebar_item.setMaximumThickness_(SIDEBAR_MAX_WIDTH)
     sidebar_item.setAllowsFullHeightLayout_(True)
     sidebar_item.setTitlebarSeparatorStyle_(NSTitlebarSeparatorStyleNone)
+    # Starts collapsed — a chat window opens straight into the conversation,
+    # like ChatGPT's own; the toolbar's native sidebar-toggle button (wired
+    # up automatically by NSSplitViewController) brings it back.
+    sidebar_item.setCollapsed_(True)
     split.addSplitViewItem_(sidebar_item)
 
     main_item = NSSplitViewItem.splitViewItemWithViewController_(main_controller)
@@ -460,9 +622,11 @@ def _build_window():
     window.setToolbar_(toolbar)
     window.setToolbarStyle_(NSWindowToolbarStyleUnified)
 
-    close_observer = WindowCloseObserver.alloc().initWithCallback_(
-        lambda: app_activation.note_window_closed("chat")
-    )
+    def _on_close():
+        app_activation.note_window_closed("chat")
+        chat_bubble.set_active(False)
+
+    close_observer = WindowCloseObserver.alloc().initWithCallback_(_on_close)
     keep_alive(close_observer)
     window.setDelegate_(close_observer)
 
@@ -470,157 +634,51 @@ def _build_window():
     return window
 
 
+# ------------------------------------------------------------ JS bridge
+
+
+def _eval_js(js):
+    if _webview is None:
+        return
+    if not _webview_ready:
+        _pending_js.append(js)
+        return
+    _webview.evaluateJavaScript_completionHandler_(js, None)
+
+
+def _call_js(func, *args):
+    payload = ", ".join(json.dumps(a) for a in args)
+    _eval_js(f"window.LW.{func}({payload});")
+
+
 # --------------------------------------------------------------- messages
 
 
-def _empty_state():
-    return nsui.section(None, [
-        nsui.row(
-            "No messages yet",
-            subtitle="Ask a quick question, or dictate one with the mic button.",
-        ),
-    ])
-
-
-def _thumbnail(path):
-    view = nsui.anchor(NSImageView.alloc().init())
-    image = NSImage.alloc().initWithContentsOfFile_(str(path))
-    if image is not None:
-        view.setImage_(image)
-    view.setImageScaling_(NSImageScaleProportionallyUpOrDown)
-    nsui.activate([
-        view.widthAnchor().constraintEqualToConstant_(THUMBNAIL_SIZE),
-        view.heightAnchor().constraintEqualToConstant_(THUMBNAIL_SIZE),
-    ])
-    return view
-
-
-def _aligned_row(inner, is_user):
-    """Wraps `inner` in a full-width row, pinned to the leading edge for
-    assistant messages or the trailing edge for the user's own — the
-    iMessage-style alignment that tells the two apart at a glance."""
-    row = nsui.anchor(NSView.alloc().init())
-    row.addSubview_(inner)
-    if is_user:
-        edge = inner.trailingAnchor().constraintEqualToAnchor_(row.trailingAnchor())
-        other = inner.leadingAnchor().constraintGreaterThanOrEqualToAnchor_(row.leadingAnchor())
-    else:
-        edge = inner.leadingAnchor().constraintEqualToAnchor_(row.leadingAnchor())
-        other = inner.trailingAnchor().constraintLessThanOrEqualToAnchor_(row.trailingAnchor())
-    nsui.activate([
-        edge,
-        other,
-        inner.topAnchor().constraintEqualToAnchor_(row.topAnchor()),
-        inner.bottomAnchor().constraintEqualToAnchor_(row.bottomAnchor()),
-    ])
-    return row
-
-
-def _text_row(message, is_user):
-    if is_user:
-        # ChatGPT tints only the user's own messages as a bubble.
-        when = _parse(message["created_at"])
-        meta = when.strftime("%H:%M") if when else ""
-        tint = NSColor.controlAccentColor().colorWithAlphaComponent_(0.18)
-        inner = nsui.bubble(message["text"], meta=meta, tint=tint)
-    else:
-        # Assistant replies are plain text, no bubble — matches ChatGPT.
-        inner = nsui.label(message["text"], size=14.0, multiline=True)
-        inner.setSelectable_(True)
-    nsui.activate([inner.widthAnchor().constraintLessThanOrEqualToConstant_(BUBBLE_MAX_WIDTH)])
-    return _aligned_row(inner, is_user)
-
-
-def _image_row(image_paths, is_user):
-    thumbs = nsui.hstack_control([_thumbnail(p) for p in image_paths], spacing=6.0)
-    return _aligned_row(thumbs, is_user)
-
-
 def _refresh_messages():
-    if _message_body is None:
-        return
     if _current_conversation_id is None:
-        nsui.set_arranged(_message_body, [_empty_state()])
+        _call_js("setMessages", [])
         return
-
     messages = chat_history.load_messages(_current_conversation_id)
-    if not messages:
-        nsui.set_arranged(_message_body, [_empty_state()])
-        return
-
-    views = []
-    for message in messages:
-        is_user = message["role"] == "user"
-        if message.get("image_paths"):
-            views.append(_image_row(message["image_paths"], is_user))
-        if message.get("text"):
-            views.append(_text_row(message, is_user))
-    nsui.set_arranged(_message_body, views)
-
-    if views:
-        AppHelper.callAfter(views[-1].scrollRectToVisible_, views[-1].bounds())
+    _call_js("setMessages", [_message_to_json(m) for m in messages])
 
 
 # ------------------------------------------------------ streaming replies
 
 
 def _start_streaming_row():
-    """Appends a placeholder assistant row — a small spinner plus an empty
-    label — once, when a send begins. Unlike _refresh_messages(), this
-    doesn't rebuild the whole list: the label is mutated directly as
-    chunks arrive, so streaming text updates stay cheap."""
-    global _streaming_row, _streaming_label, _streaming_spinner
-    if _message_body is None:
-        return
-
-    spinner = nsui.anchor(NSProgressIndicator.alloc().init())
-    spinner.setStyle_(NSProgressIndicatorStyleSpinning)
-    spinner.setControlSize_(NSControlSizeSmall)
-    spinner.setDisplayedWhenStopped_(False)
-    spinner.startAnimation_(None)
-
-    label = nsui.label("", size=14.0, multiline=True)
-
-    inner = nsui.anchor(NSView.alloc().init())
-    inner.addSubview_(spinner)
-    inner.addSubview_(label)
-    nsui.activate([
-        spinner.leadingAnchor().constraintEqualToAnchor_(inner.leadingAnchor()),
-        spinner.centerYAnchor().constraintEqualToAnchor_(inner.centerYAnchor()),
-        spinner.topAnchor().constraintGreaterThanOrEqualToAnchor_(inner.topAnchor()),
-
-        label.leadingAnchor().constraintEqualToAnchor_constant_(spinner.trailingAnchor(), 8.0),
-        label.trailingAnchor().constraintLessThanOrEqualToAnchor_(inner.trailingAnchor()),
-        label.topAnchor().constraintEqualToAnchor_(inner.topAnchor()),
-        label.bottomAnchor().constraintEqualToAnchor_(inner.bottomAnchor()),
-    ])
-    nsui.activate([inner.widthAnchor().constraintLessThanOrEqualToConstant_(BUBBLE_MAX_WIDTH)])
-
-    row = _aligned_row(inner, is_user=False)
-    nsui.set_arranged(_message_body, list(_message_body.arrangedSubviews()) + [row])
-
-    _streaming_row = row
-    _streaming_label = label
-    _streaming_spinner = spinner
-    AppHelper.callAfter(row.scrollRectToVisible_, row.bounds())
+    _call_js("startStreaming")
 
 
 def _update_streaming_text(text):
-    if _streaming_label is None:
-        return
-    if text and _streaming_spinner is not None:
-        _streaming_spinner.stopAnimation_(None)
-        _streaming_spinner.setHidden_(True)
-    _streaming_label.setStringValue_(text)
-    if _streaming_row is not None:
-        _streaming_row.scrollRectToVisible_(_streaming_row.bounds())
+    _call_js("updateStreaming", text)
 
 
-def _end_streaming_row():
-    global _streaming_row, _streaming_label, _streaming_spinner
-    _streaming_row = None
-    _streaming_label = None
-    _streaming_spinner = None
+def _end_streaming_row(final_message=None):
+    _call_js("endStreaming", final_message)
+
+
+def _stream_error(message_text):
+    _call_js("setStreamError", message_text)
 
 
 # ---------------------------------------------------------- conversations
@@ -684,23 +742,40 @@ def _on_delete_conversation(conversation_id):
 
 
 def _populate_chat_model_popup(selected_id):
-    _model_popup.removeAllItems()
-    for m in _available_models:
-        badge = " 🖼" if m.get("supports_images") else ""
-        _model_popup.addItemWithTitle_(f"{m['name']}{badge}  —  {m['id']}")
-    ids = [m["id"] for m in _available_models]
-    if selected_id in ids:
-        _model_popup.selectItemAtIndex_(ids.index(selected_id))
-    elif selected_id:
-        _model_popup.addItemWithTitle_(selected_id)
-        _model_popup.selectItemAtIndex_(_model_popup.numberOfItems() - 1)
+    _model_picker.set_models(_available_models)
+    _model_picker.select(selected_id)
+    _update_attach_availability()
 
 
 def _current_model_id():
-    index = _model_popup.indexOfSelectedItem()
-    if 0 <= index < len(_available_models):
-        return _available_models[index]["id"]
-    return None
+    return _model_picker.selected_id()
+
+
+def _update_attach_availability():
+    """Disables the attach button for a model that can't accept images —
+    otherwise you can stage an attachment the model will just ignore (or
+    error on) once you actually send. Left enabled for a model id we don't
+    have data for yet (still loading, or a stale saved id not in the
+    current list) rather than guessing it can't take images."""
+    if _attach_button is None:
+        return
+    model_id = _model_picker.selected_id() if _model_picker is not None else None
+    model = next((m for m in _available_models if m["id"] == model_id), None)
+    supports = True if model is None else bool(model.get("supports_images"))
+    _attach_button.setEnabled_(supports)
+    _attach_button.setToolTip_(
+        "Attach image" if supports else "This model doesn't support image messages"
+    )
+
+
+def _on_model_picker_change(model_id):
+    """Picking a model from the input bar's chip saves it onto whichever
+    conversation is open right away — the model is per-conversation, not
+    global, so this shouldn't wait for the next send to stick."""
+    if _current_conversation_id is not None:
+        chat_history.set_conversation_model(_current_conversation_id, model_id)
+        _refresh_sidebar()
+    _update_attach_availability()
 
 
 def _on_refresh_chat_models():
@@ -802,9 +877,9 @@ def _stop_chat_recording():
         # audio) is the same kind of slow, main-thread-unsafe work as
         # starting it — see the comment in _on_mic_clicked().
         wav_bytes = recorder.stop()
+        if not wav_bytes or not recorder.last_had_speech:
+            return
         try:
-            if not wav_bytes or not recorder.last_had_speech:
-                return
             cfg = config.load()
             transcriber = get_transcriber(
                 engine=cfg["engine"],
@@ -813,7 +888,12 @@ def _stop_chat_recording():
                 api_key=cfg["openrouter_api_key"],
             )
             text = transcriber.transcribe(wav_bytes).strip()
-        except Exception:
+        except Exception as e:
+            # This used to fail silently (a bare except: return) — from the
+            # user's side that looks exactly like "the mic doesn't work",
+            # whatever the actual cause (no API key, no network, a local
+            # model that isn't downloaded yet).
+            rumps.notification("lite-whisper", "Chat", f"Couldn't transcribe: {e}")
             return
         if text:
             AppHelper.callAfter(_insert_dictated_text, text)
@@ -825,6 +905,34 @@ def _insert_dictated_text(text):
     current = str(_input_view.string())
     separator = " " if current and not current.endswith(" ") else ""
     _input_view.setString_(current + separator + text)
+    _update_input_height()
+
+
+def _update_input_height():
+    """Grows/shrinks the input row to fit what's typed, clamped to
+    [INPUT_TEXT_MIN_HEIGHT, INPUT_TEXT_MAX_HEIGHT] — past the max it just
+    scrolls internally instead of continuing to grow. InputDelegate calls
+    this on every user edit (textDidChange_); a couple of call sites that
+    change the text programmatically (clearing on send, inserting dictated
+    text) call it directly since setString_ doesn't fire that delegate
+    method itself.
+    """
+    if _input_view is None or _input_scroll_height is None:
+        return
+    layout_manager = _input_view.layoutManager()
+    container = _input_view.textContainer()
+    layout_manager.ensureLayoutForTextContainer_(container)
+    used_height = layout_manager.usedRectForTextContainer_(container).size.height
+    vertical_inset = _input_view.textContainerInset()[1] * 2.0
+    target = max(INPUT_TEXT_MIN_HEIGHT, min(INPUT_TEXT_MAX_HEIGHT, used_height + vertical_inset))
+    if abs(_input_scroll_height.constant() - target) > 0.5:
+        _input_scroll_height.setConstant_(target)
+    # Once the row has hit its max height, further typing scrolls inside it
+    # rather than growing it further — without this, the caret can end up
+    # below the clipped, visible area (you keep typing but can't see the
+    # characters landing), which reads as broken/janky the same way a
+    # growing-in-the-wrong-direction box would.
+    _input_view.scrollRangeToVisible_(_input_view.selectedRange())
 
 
 # ---------------------------------------------------------------- send
@@ -837,12 +945,17 @@ def _set_sending_ui(streaming):
     global _send_state
     _send_state = "streaming" if streaming else "idle"
     _input_view.setEditable_(not streaming)
-    _attach_button.setEnabled_(not streaming)
     _mic_button.setEnabled_(not streaming)
     if streaming:
-        _set_icon(_send_button, "stop.circle.fill", "Stop")
+        _attach_button.setEnabled_(False)
+        _set_send_icon(_send_button, "stop.circle.fill", "Stop", NSColor.systemRedColor())
     else:
-        _set_icon(_send_button, "arrow.up.circle.fill", "Send")
+        # Not just setEnabled_(True) — re-enabling has to respect whether
+        # the current model even supports images, or it would silently
+        # override _update_attach_availability()'s decision every time a
+        # reply finishes streaming.
+        _update_attach_availability()
+        _set_send_icon(_send_button, "arrow.up.circle.fill", "Send", NSColor.controlAccentColor())
 
 
 def _on_send_button_clicked():
@@ -857,8 +970,77 @@ def _on_stop_streaming():
         _stream_cancel_event.set()
 
 
+def _generate_reply(conversation_id):
+    """Starts (or restarts) the assistant's turn for `conversation_id`:
+    sends the full history so far to chat_engine.stream() and streams the
+    reply into the transcript. Shared by a normal send, regenerate, retry-
+    after-error and edit-and-resend — they differ only in how the history
+    leading up to this point was produced, not in how the reply itself is
+    generated and rendered."""
+    global _stream_cancel_event
+
+    cfg = config.load()
+    convo = next((c for c in _conversations if c["id"] == conversation_id), None)
+    model = (convo.get("model") if convo else None) or cfg["chat_model"]
+    if not model:
+        rumps.notification("lite-whisper", "Chat", "Pick a model first")
+        return
+
+    history_for_api = [
+        {"role": m["role"], "text": m["text"], "image_paths": m["image_paths"]}
+        for m in chat_history.load_messages(conversation_id)
+    ]
+    if not history_for_api:
+        return
+
+    cancel_event = threading.Event()
+    _stream_cancel_event = cancel_event
+    _set_sending_ui(True)
+    _start_streaming_row()
+
+    def call_api():
+        accumulated = []
+        error = None
+        try:
+            for chunk in chat_engine.stream(
+                history_for_api, model, cfg["openrouter_api_key"], cancel_event
+            ):
+                accumulated.append(chunk)
+                AppHelper.callAfter(_update_streaming_text, "".join(accumulated))
+        except Exception as e:
+            error = e
+
+        final_text = "".join(accumulated)
+
+        def on_done():
+            _set_sending_ui(False)
+            if conversation_id == _current_conversation_id:
+                if final_text:
+                    new_id = chat_history.append_message(conversation_id, "assistant", final_text)
+                    _end_streaming_row({
+                        "id": new_id,
+                        "role": "assistant",
+                        "text": final_text,
+                        "images": [],
+                        "time": datetime.now().strftime("%H:%M"),
+                    })
+                elif error is not None:
+                    _stream_error(str(error))
+                else:
+                    _end_streaming_row(None)
+            elif final_text:
+                chat_history.append_message(conversation_id, "assistant", final_text)
+            _refresh_sidebar()
+            if error is not None:
+                rumps.notification("lite-whisper", "Chat error", str(error))
+
+        AppHelper.callAfter(on_done)
+
+    threading.Thread(target=call_api, daemon=True).start()
+
+
 def _on_send():
-    global _pending_images, _stream_cancel_event
+    global _pending_images
 
     if _send_state == "streaming":
         return
@@ -881,55 +1063,72 @@ def _on_send():
     stored_images = [p for p in (_persist_image(p) for p in images) if p is not None]
 
     is_first_message = len(chat_history.load_messages(conversation_id)) == 0
-    chat_history.append_message(conversation_id, "user", text, image_paths=stored_images)
+    new_id = chat_history.append_message(conversation_id, "user", text, image_paths=stored_images)
     if is_first_message:
         chat_history.rename_conversation(conversation_id, text[:40] if text else "Image")
     chat_history.set_conversation_model(conversation_id, model)
 
     _input_view.setString_("")
+    _update_input_height()
     _pending_images = []
     _attach_button.setToolTip_("Attach image")
     _refresh_sidebar(select_id=conversation_id)
+
+    _call_js("appendMessage", {
+        "id": new_id,
+        "role": "user",
+        "text": text,
+        "images": [
+            {"data": uri, "name": Path(p).name}
+            for p, uri in ((p, _image_data_uri(p)) for p in stored_images)
+            if uri
+        ],
+        "time": datetime.now().strftime("%H:%M"),
+    })
+
+    _generate_reply(conversation_id)
+
+
+# ------------------------------------------------------- bridge actions
+
+
+def _on_regenerate(message_id):
+    if _send_state == "streaming" or _current_conversation_id is None:
+        return
+    try:
+        mid = int(message_id)
+    except (TypeError, ValueError):
+        return
+    chat_history.delete_messages_from(_current_conversation_id, mid)
     _refresh_messages()
+    _generate_reply(_current_conversation_id)
 
-    history_for_api = [
-        {"role": m["role"], "text": m["text"], "image_paths": m["image_paths"]}
-        for m in chat_history.load_messages(conversation_id)
-    ]
 
-    cancel_event = threading.Event()
-    _stream_cancel_event = cancel_event
-    _set_sending_ui(True)
-    _start_streaming_row()
+def _on_edit(message_id, text):
+    if _send_state == "streaming" or _current_conversation_id is None:
+        return
+    try:
+        mid = int(message_id)
+    except (TypeError, ValueError):
+        return
+    text = (text or "").strip()
+    if not text:
+        return
+    chat_history.update_message_text(mid, text)
+    chat_history.delete_messages_after(_current_conversation_id, mid)
+    _refresh_messages()
+    _generate_reply(_current_conversation_id)
 
-    def call_api():
-        accumulated = []
-        error = None
-        try:
-            for chunk in chat_engine.stream(
-                history_for_api, model, cfg["openrouter_api_key"], cancel_event
-            ):
-                accumulated.append(chunk)
-                AppHelper.callAfter(_update_streaming_text, "".join(accumulated))
-        except Exception as e:
-            error = e
 
-        final_text = "".join(accumulated)
-
-        def on_done():
-            _end_streaming_row()
-            _set_sending_ui(False)
-            if final_text:
-                chat_history.append_message(conversation_id, "assistant", final_text)
-            if conversation_id == _current_conversation_id:
-                _refresh_messages()
-            _refresh_sidebar()
-            if error is not None:
-                rumps.notification("lite-whisper", "Chat error", str(error))
-
-        AppHelper.callAfter(on_done)
-
-    threading.Thread(target=call_api, daemon=True).start()
+def _on_retry(message_id):
+    # The error card that triggered this isn't a real stored message (a
+    # failed reply is never persisted — see _generate_reply's on_done), so
+    # there's nothing to delete; refreshing just drops that ephemeral row
+    # before trying again.
+    if _send_state == "streaming" or _current_conversation_id is None:
+        return
+    _refresh_messages()
+    _generate_reply(_current_conversation_id)
 
 
 # -------------------------------------------------------------------- API
@@ -949,3 +1148,26 @@ def show():
     _window.makeKeyAndOrderFront_(None)
     NSApp.activateIgnoringOtherApps_(True)
     app_activation.note_window_shown("chat")
+    chat_bubble.set_active(True)
+
+
+def hide():
+    """Ordered out, not closed — the window (and everything in it: the
+    selected conversation, whatever's in the input box) stays exactly as it
+    was, ready to reappear via toggle()/show(). windowWillClose_: doesn't
+    fire for orderOut_, so the Dock-icon/bubble bookkeeping that a real
+    close would trigger has to happen here explicitly."""
+    if _window is not None and _window.isVisible():
+        _window.orderOut_(None)
+        app_activation.note_window_closed("chat")
+        chat_bubble.set_active(False)
+
+
+def toggle():
+    """The floating bubble icon's click handler: open it if it isn't
+    showing, hide it (not close/quit the conversation) if it already is —
+    the bubble is meant for opening/using chat, not for a close button."""
+    if _window is not None and _window.isVisible():
+        hide()
+    else:
+        show()

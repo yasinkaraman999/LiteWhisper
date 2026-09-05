@@ -97,18 +97,19 @@ def delete_conversation(conversation_id):
 def load_messages(conversation_id):
     with closing(_connect()) as conn:
         rows = conn.execute(
-            "SELECT role, text, image_paths_json, created_at FROM messages "
+            "SELECT id, role, text, image_paths_json, created_at FROM messages "
             "WHERE conversation_id = ? ORDER BY id ASC",
             (conversation_id,),
         ).fetchall()
     return [
         {
+            "id": mid,
             "role": role,
             "text": text,
             "image_paths": json.loads(image_paths_json) if image_paths_json else [],
             "created_at": created_at,
         }
-        for role, text, image_paths_json, created_at in rows
+        for mid, role, text, image_paths_json, created_at in rows
     ]
 
 
@@ -116,12 +117,43 @@ def append_message(conversation_id, role, text, image_paths=None):
     now = datetime.now().isoformat(timespec="seconds")
     image_paths_json = json.dumps(image_paths) if image_paths else None
     with closing(_connect()) as conn:
-        conn.execute(
+        cur = conn.execute(
             "INSERT INTO messages (conversation_id, role, text, image_paths_json, created_at) "
             "VALUES (?, ?, ?, ?, ?)",
             (conversation_id, role, text, image_paths_json, now),
         )
         conn.execute(
             "UPDATE conversations SET updated_at = ? WHERE id = ?", (now, conversation_id)
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def update_message_text(message_id, text):
+    with closing(_connect()) as conn:
+        conn.execute("UPDATE messages SET text = ? WHERE id = ?", (text, message_id))
+        conn.commit()
+
+
+def delete_messages_from(conversation_id, message_id):
+    """Deletes `message_id` and every message after it — used by regenerate,
+    which drops the stale assistant reply (and anything past it) before
+    resending."""
+    with closing(_connect()) as conn:
+        conn.execute(
+            "DELETE FROM messages WHERE conversation_id = ? AND id >= ?",
+            (conversation_id, message_id),
+        )
+        conn.commit()
+
+
+def delete_messages_after(conversation_id, message_id):
+    """Deletes every message after `message_id`, keeping it — used by edit,
+    which rewrites one user turn in place and drops whatever replies had
+    followed it before resending."""
+    with closing(_connect()) as conn:
+        conn.execute(
+            "DELETE FROM messages WHERE conversation_id = ? AND id > ?",
+            (conversation_id, message_id),
         )
         conn.commit()

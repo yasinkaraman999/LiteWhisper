@@ -19,7 +19,6 @@ from AppKit import (
     NSMakeRect,
     NSPanel,
     NSPointInRect,
-    NSShadow,
     NSView,
     NSWindowCollectionBehaviorCanJoinAllSpaces,
     NSWindowCollectionBehaviorFullScreenAuxiliary,
@@ -27,6 +26,7 @@ from AppKit import (
     NSWindowStyleMaskBorderless,
     NSWindowStyleMaskNonactivatingPanel,
 )
+from Quartz import CGPathCreateWithEllipseInRect, CGRectMake
 
 import config
 import overlay_dock
@@ -44,6 +44,11 @@ DRAG_THRESHOLD = 4.0
 
 _panel = None
 _on_click = None
+_image_view = None
+_active = False
+
+IDLE_SYMBOL = "bubble.left.and.bubble.right"
+ACTIVE_SYMBOL = "bubble.left.and.bubble.right.fill"
 
 
 def _panel_size():
@@ -135,13 +140,43 @@ def _glass_view(frame):
     glass = NSGlassEffectView.alloc().initWithFrame_(frame)
     glass.setCornerRadius_(CORNER_RADIUS)
     glass.setWantsLayer_(True)
-
-    shadow = NSShadow.alloc().init()
-    shadow.setShadowColor_(NSColor.blackColor().colorWithAlphaComponent_(0.30))
-    shadow.setShadowBlurRadius_(14.0)
-    shadow.setShadowOffset_((0.0, -3.0))
-    glass.setShadow_(shadow)
     return glass
+
+
+def _shadow_view(frame):
+    """A separate, invisible view sitting behind the glass purely to cast a
+    shadow — the glass view's own layer clips to its rounded corners
+    (masksToBounds), and a shadow is drawn *outside* those bounds, so
+    setting it on the glass layer directly clips the shadow away (or, via
+    the NSView-level setShadow: API used previously, falls back to a
+    shadow that follows the layer's square bounds instead of the visible
+    circle — either way it read as an unpolished, boxy smudge rather than
+    the soft round drop shadow every native floating macOS control has).
+
+    Only setWantsLayer_ happens here — configuring the CALayer's shadow
+    properties has to wait until *after* this view is in the window's view
+    hierarchy (see _apply_shadow below): AppKit swaps in its own backing
+    layer once a layer-backed view is parented, which silently resets
+    shadowOpacity (though not shadowRadius/shadowPath, oddly) back to 0 if
+    it was set beforehand.
+    """
+    view = NSView.alloc().initWithFrame_(frame)
+    view.setWantsLayer_(True)
+    return view
+
+
+def _apply_shadow(view):
+    frame = view.frame()
+    layer = view.layer()
+    layer.setShadowColor_(NSColor.blackColor().CGColor())
+    layer.setShadowOpacity_(0.28)
+    layer.setShadowRadius_(9.0)
+    layer.setShadowOffset_((0.0, -2.0))
+    layer.setShadowPath_(
+        CGPathCreateWithEllipseInRect(
+            CGRectMake(0.0, 0.0, frame.size.width, frame.size.height), None
+        )
+    )
 
 
 def _build_panel():
@@ -170,25 +205,43 @@ def _build_panel():
     background = BubbleIconView.alloc().initWithFrame_(NSMakeRect(0, 0, panel_width, panel_height))
     panel.setContentView_(background)
 
+    icon_frame = NSMakeRect(SHADOW_PADDING, SHADOW_PADDING, ICON_SIZE, ICON_SIZE)
+    shadow_view = _shadow_view(icon_frame)
+    background.addSubview_(shadow_view)
+    _apply_shadow(shadow_view)
+
     content = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, ICON_SIZE, ICON_SIZE))
-    icon = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
-        "bubble.left.and.bubble.right.fill", "Chat"
-    )
-    icon_configuration = NSImageSymbolConfiguration.configurationWithPointSize_weight_(
-        ICON_SIZE * 0.42, NSFontWeightMedium
-    )
     image_view = NSImageView.alloc().initWithFrame_(NSMakeRect(0, 0, ICON_SIZE, ICON_SIZE))
-    image_view.setImage_(icon.imageWithSymbolConfiguration_(icon_configuration))
-    image_view.setContentTintColor_(NSColor.controlAccentColor())
     content.addSubview_(image_view)
 
-    glass = _glass_view(NSMakeRect(SHADOW_PADDING, SHADOW_PADDING, ICON_SIZE, ICON_SIZE))
+    global _image_view
+    _image_view = image_view
+
+    glass = _glass_view(icon_frame)
     glass.setContentView_(content)
     background.addSubview_(glass)
 
     _panel = panel
     _move_to_dock(config.load()["chat_bubble_dock"])
+    _apply_icon()
     return panel
+
+
+def _apply_icon():
+    if _image_view is None:
+        return
+    symbol = ACTIVE_SYMBOL if _active else IDLE_SYMBOL
+    icon = NSImage.imageWithSystemSymbolName_accessibilityDescription_(symbol, "Chat")
+    configuration = NSImageSymbolConfiguration.configurationWithPointSize_weight_(
+        ICON_SIZE * 0.42, NSFontWeightMedium
+    )
+    _image_view.setImage_(icon.imageWithSymbolConfiguration_(configuration))
+    # Colored while Chat is open, muted gray otherwise — a second, more
+    # visible cue than the filled-vs-outline glyph swap alone, so it reads
+    # at a glance even at a small size or in peripheral vision.
+    _image_view.setContentTintColor_(
+        NSColor.controlAccentColor() if _active else NSColor.secondaryLabelColor()
+    )
 
 
 # ------------------------------------------------------------------- API
@@ -217,3 +270,15 @@ def refresh_from_config():
     set_visible(cfg["chat_bubble_visible"])
     if cfg["chat_bubble_visible"]:
         _move_to_dock(cfg["chat_bubble_dock"])
+
+
+def set_active(active):
+    """Swaps the icon to its filled variant while the Chat window is open —
+    otherwise the bubble looks identical whether or not you already have
+    Chat open, the "icon doesn't change" complaint. chat_window.py calls
+    this from show() and from its window-close observer."""
+    global _active
+    if active == _active:
+        return
+    _active = active
+    _apply_icon()

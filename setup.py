@@ -1,7 +1,25 @@
+import os
+
 from setuptools import setup
 
 APP = ["main.py"]
 ICON_FILE = "logos/AppIcon.icns"
+
+
+def _chat_transcript_data_files():
+    """(dest_dir, [files]) entries for every directory under chat_transcript/
+    (index.html/app.js/style.css plus the vendored markdown-it/highlight.js/
+    KaTeX bundles and KaTeX's font files) — walked instead of listed by hand
+    so a new vendored file doesn't silently go missing from the packaged
+    app the way a hand-maintained list could."""
+    entries = []
+    for root, _dirs, files in os.walk("chat_transcript"):
+        if not files:
+            continue
+        entries.append((root, [os.path.join(root, f) for f in files]))
+    return entries
+
+
 DATA_FILES = [
     (
         "logos",
@@ -11,7 +29,8 @@ DATA_FILES = [
             "logos/lite-whisper-transparent-colored-logo.png",
             "logos/lite-whisper-white-bg-logo.png",
         ],
-    )
+    ),
+    *_chat_transcript_data_files(),
 ]
 OPTIONS = {
     "argv_emulation": False,
@@ -34,6 +53,7 @@ OPTIONS = {
         "requests",
         "_sounddevice_data",
         "AVFoundation",
+        "WebKit",
         "faster_whisper",
         "ctranslate2",
         "tokenizers",
