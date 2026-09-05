@@ -13,7 +13,6 @@ from AppKit import (
     NSImage,
     NSNoTitle,
     NSTextAlignmentCenter,
-    NSTextAlignmentRight,
     NSTimer,
     NSTrackingActiveInKeyWindow,
     NSTrackingArea,
@@ -28,9 +27,6 @@ import output
 import theme
 from ui_helpers import ButtonTarget, keep_alive
 
-BUBBLE_RADIUS = 14.0
-BUBBLE_PADDING_X = 12.0
-BUBBLE_PADDING_Y = 9.0
 BUBBLE_GAP = 8.0
 
 CHIP_RADIUS = 9.0
@@ -161,49 +157,17 @@ def _bubble(entry):
     """One transcription, drawn as a full-width chat bubble."""
     when = _parse(entry["timestamp"])
 
-    text = nsui.label(entry["text"], size=13.0, multiline=True)
-    text.setSelectable_(True)
-
-    meta = nsui.secondary(_meta_text(entry, when), size=10.0)
-    meta.setAlignment_(NSTextAlignmentRight)
-
-    content = nsui.anchor(NSView.alloc().init())
-    content.addSubview_(text)
-    content.addSubview_(meta)
-    nsui.activate([
-        text.topAnchor().constraintEqualToAnchor_constant_(
-            content.topAnchor(), BUBBLE_PADDING_Y
-        ),
-        text.leadingAnchor().constraintEqualToAnchor_constant_(
-            content.leadingAnchor(), BUBBLE_PADDING_X
-        ),
-        # A permanent gutter for the copy button, so the first line never
-        # runs underneath it when it appears on hover.
-        text.trailingAnchor().constraintEqualToAnchor_constant_(
-            content.trailingAnchor(), -(BUBBLE_PADDING_X + COPY_BUTTON_SIZE)
-        ),
-        meta.topAnchor().constraintEqualToAnchor_constant_(text.bottomAnchor(), 3.0),
-        meta.leadingAnchor().constraintGreaterThanOrEqualToAnchor_(text.leadingAnchor()),
-        meta.trailingAnchor().constraintEqualToAnchor_constant_(
-            content.trailingAnchor(), -BUBBLE_PADDING_X
-        ),
-        meta.bottomAnchor().constraintEqualToAnchor_constant_(
-            content.bottomAnchor(), -BUBBLE_PADDING_Y
-        ),
-    ])
-
-    box = nsui.anchor(NSBox.alloc().init())
-    box.setBoxType_(NSBoxCustom)
-    box.setTitlePosition_(NSNoTitle)
-    box.setBorderWidth_(0.0)
-    box.setCornerRadius_(BUBBLE_RADIUS)
     # An accent tint marks these as the user's own dictations, the way a
     # messaging app tints sent messages. Rebuilt on every visit to the page,
-    # so a change of accent or appearance is picked up.
-    box.setFillColor_(NSColor.controlAccentColor().colorWithAlphaComponent_(0.18))
-    box.setContentViewMargins_((0.0, 0.0))
-    box.setContentView_(content)
-    nsui.pin(content, box)
+    # so a change of accent or appearance is picked up. The trailing gutter
+    # reserves room so the first line never runs underneath the copy button
+    # that appears on hover.
+    box = nsui.bubble(
+        entry["text"],
+        meta=_meta_text(entry, when),
+        tint=NSColor.controlAccentColor().colorWithAlphaComponent_(0.18),
+        trailing_gutter=COPY_BUTTON_SIZE,
+    )
 
     copy_button = _copy_button()
 

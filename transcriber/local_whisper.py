@@ -1,10 +1,24 @@
+import os
 import shutil
 import tempfile
+import threading
+import unicodedata
 from pathlib import Path
 
 from . import Transcriber
 
 _loaded_models = {}  # size -> WhisperModel
+
+# Same file list faster_whisper.utils.download_model() uses internally —
+# kept in sync here so download_with_progress() populates the exact same
+# cache layout _get_model() will later find and load without re-downloading.
+_ALLOW_PATTERNS = [
+    "config.json",
+    "preprocessor_config.json",
+    "model.bin",
+    "tokenizer.json",
+    "vocabulary.*",
+]
 
 # Approximate figures for the settings UI (actual disk usage is measured
 # directly once a model is downloaded via downloaded_size_bytes()).
@@ -35,6 +49,76 @@ def _get_model(size, download_root):
             size, device="auto", compute_type="default", download_root=str(download_root)
         )
     return _loaded_models[size]
+
+
+def download_with_progress(size, download_root, on_progress):
+    """Downloads a model's files, calling on_progress(fraction) as bytes
+    arrive.
+
+    faster_whisper.utils.download_model() hardcodes tqdm_class=disabled_tqdm
+    internally, so there's no way to observe progress by going through it —
+    huggingface_hub.snapshot_download() is called directly instead, with the
+    same repo_id/cache_dir/allow_patterns download_model() uses, so the
+    cache ends up exactly where _get_model() expects it and never re-fetches.
+
+    Also forces the classic HTTP download path: when the optional hf_xet
+    package is installed, huggingface_hub silently switches to its own
+    "xet" transfer protocol, which reports progress through a completely
+    different mechanism and ignores tqdm_class entirely — the progress
+    callback below would just never fire.
+    """
+    os.environ["HF_HUB_DISABLE_XET"] = "1"
+
+    from huggingface_hub import snapshot_download
+    from tqdm.auto import tqdm as tqdm_base
+
+    lock = threading.Lock()
+    totals = {}  # id(bar) -> (n, total), byte-unit bars only
+    best = [0.0]
+
+    def report():
+        with lock:
+            done = sum(n for n, _ in totals.values())
+            total = sum(t for _, t in totals.values())
+        if not total:
+            return
+        # Resuming a previously-interrupted download can make
+        # huggingface_hub reconcile/"reconstruct" already-fetched chunks
+        # through a second, separate progress pass that doesn't line up
+        # with the first — clamped here so the reported percentage never
+        # visibly jumps backwards, whatever is happening underneath.
+        fraction = max(best[0], done / total)
+        best[0] = fraction
+        on_progress(fraction)
+
+    class _ProgressTqdm(tqdm_base):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            if self.unit == "B":
+                with lock:
+                    totals[id(self)] = (self.n, self.total or 0)
+                report()
+
+        def update(self, n=1):
+            result = super().update(n)
+            if self.unit == "B":
+                with lock:
+                    totals[id(self)] = (self.n, self.total or 0)
+                report()
+            return result
+
+        def close(self):
+            with lock:
+                totals.pop(id(self), None)
+            report()
+            super().close()
+
+    snapshot_download(
+        repo_id=_repo_id(size),
+        cache_dir=str(download_root),
+        allow_patterns=_ALLOW_PATTERNS,
+        tqdm_class=_ProgressTqdm,
+    )
 
 
 def is_downloaded(size, download_root):
@@ -79,4 +163,7 @@ class LocalWhisperTranscriber(Transcriber):
             tmp.write(wav_bytes)
             tmp.flush()
             segments, _info = model.transcribe(tmp.name)
-            return "".join(segment.text for segment in segments).strip()
+            text = "".join(segment.text for segment in segments).strip()
+            # See openrouter.py's transcribe() for why this is normalized
+            # to a single canonical form here.
+            return unicodedata.normalize("NFC", text)

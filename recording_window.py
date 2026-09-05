@@ -30,7 +30,6 @@ from AppKit import (
     NSMakeRect,
     NSPanel,
     NSPointInRect,
-    NSScreen,
     NSShadow,
     NSTextField,
     NSTimer,
@@ -43,6 +42,7 @@ from AppKit import (
 )
 
 import config
+import overlay_dock
 from ui_helpers import ButtonTarget, keep_alive
 
 STYLE_CLASSIC = "classic"
@@ -52,7 +52,6 @@ STYLE_NONE = "none"
 CLASSIC_SIZE = (300.0, 88.0)
 MINI_SIZE = (146.0, 38.0)
 CORNER_RADIUS = 16.0
-SCREEN_MARGIN = 18.0
 
 # Transparent slack around the glass so its shadow has somewhere to fall
 # off. Without it the shadow is clipped at the window edge and reads as a
@@ -77,35 +76,11 @@ _hint_label = None
 _title_label = None
 _state = "idle"
 _stop_callback = None
+_live_stop_callback = None
 _style = STYLE_CLASSIC
 
 
 # ---------------------------------------------------------------- docking
-
-
-def _dock_points(size):
-    """Centre point for every slot in the frame of docks around the screen."""
-    screen = NSScreen.mainScreen()
-    if screen is None:
-        return {}
-    area = screen.visibleFrame()
-    width, height = size
-    half_w, half_h = width / 2.0, height / 2.0
-
-    points = {}
-    for slot in range(config.DOCK_SLOTS):
-        fraction = (slot + 0.5) / config.DOCK_SLOTS
-        x = area.origin.x + area.size.width * fraction
-        y = area.origin.y + area.size.height * fraction
-        points[f"top-{slot}"] = (
-            x, area.origin.y + area.size.height - SCREEN_MARGIN - half_h,
-        )
-        points[f"bottom-{slot}"] = (x, area.origin.y + SCREEN_MARGIN + half_h)
-        points[f"left-{slot}"] = (area.origin.x + SCREEN_MARGIN + half_w, y)
-        points[f"right-{slot}"] = (
-            area.origin.x + area.size.width - SCREEN_MARGIN - half_w, y,
-        )
-    return points
 
 
 def _current_size():
@@ -122,7 +97,7 @@ def _panel_size():
 def _move_to_dock(dock_name, animate=False):
     # Docking is measured against the visible box, so the shadow padding
     # does not push the panel away from the screen edge.
-    points = _dock_points(_current_size())
+    points = overlay_dock.dock_points(_current_size())
     center = points.get(dock_name) or points.get(config.DEFAULTS["recording_window_dock"])
     if center is None or _panel is None:
         return
@@ -136,12 +111,7 @@ def _nearest_dock():
     frame = _panel.frame()
     cx = frame.origin.x + frame.size.width / 2.0
     cy = frame.origin.y + frame.size.height / 2.0
-    best, best_distance = None, None
-    for name, (px, py) in _dock_points(_current_size()).items():
-        distance = (px - cx) ** 2 + (py - cy) ** 2
-        if best_distance is None or distance < best_distance:
-            best, best_distance = name, distance
-    return best
+    return overlay_dock.nearest_dock((cx, cy), _current_size())
 
 
 # ------------------------------------------------------------------ views
@@ -222,7 +192,7 @@ class MeterView(NSView):
         self._phase = 0.0
 
     def tick_(self, timer):
-        if _state == "recording":
+        if _state in ("recording", "live"):
             level = self._level_source() if self._level_source else 0.0
             self._levels.append(level)
         elif _state == "processing":
@@ -231,7 +201,7 @@ class MeterView(NSView):
 
     def drawRect_(self, rect):
         bounds = self.bounds()
-        if _state == "recording":
+        if _state in ("recording", "live"):
             self._draw_waveform(bounds)
         elif _state == "processing":
             self._draw_swell(bounds)
@@ -450,17 +420,19 @@ def _glass_view(frame):
 
 
 def _on_stop_clicked():
-    if _stop_callback is not None:
-        _stop_callback()
+    callback = _live_stop_callback if _state == "live" else _stop_callback
+    if callback is not None:
+        callback()
 
 
 # ------------------------------------------------------------------- API
 
 
-def configure(stop_callback, level_source):
+def configure(stop_callback, level_source, live_stop_callback=None):
     """Wire the overlay to the app. Called once at startup."""
-    global _stop_callback
+    global _stop_callback, _live_stop_callback
     _stop_callback = stop_callback
+    _live_stop_callback = live_stop_callback
     _rebuild_if_needed(level_source)
 
 
@@ -519,21 +491,25 @@ def set_state(state):
     if _panel is None:
         return
 
-    if state == "recording" and _meter is not None:
+    if state in ("recording", "live") and _meter is not None:
         _meter.reset()
 
     if _title_label is not None:
         _title_label.setStringValue_(
-            {"recording": "Recording", "processing": "Transcribing..."}.get(
-                state, "Ready"
-            )
+            {
+                "recording": "Recording",
+                "live": "Live",
+                "processing": "Transcribing...",
+            }.get(state, "Ready")
         )
     if _hint_label is not None:
-        _hint_label.setStringValue_(
-            "\u2325Space to stop \u00b7 esc to cancel"
-            if state == "recording"
-            else "\u2325Space to start"
-        )
+        if state == "live":
+            hint = "\u21e7\u2325Space to stop \u00b7 esc to cancel"
+        elif state == "recording":
+            hint = "\u2325Space to stop \u00b7 esc to cancel"
+        else:
+            hint = "\u2325Space to start \u00b7 \u21e7\u2325Space for live"
+        _hint_label.setStringValue_(hint)
 
     if state == "idle" and not cfg["recording_window_always_show"]:
         _set_animating(False)
@@ -541,7 +517,7 @@ def set_state(state):
     else:
         _move_to_dock(cfg["recording_window_dock"])
         _panel.orderFrontRegardless()
-        _set_animating(state in ("recording", "processing"))
+        _set_animating(state in ("recording", "live", "processing"))
         if _meter is not None:
             _meter.setNeedsDisplay_(True)
 

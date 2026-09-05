@@ -5,6 +5,7 @@ CONFIG_DIR = Path.home() / ".config" / "lite-whisper"
 CONFIG_PATH = CONFIG_DIR / "config.json"
 LOCAL_MODELS_DIR = CONFIG_DIR / "models"
 DEBUG_AUDIO_DIR = CONFIG_DIR / "debug_audio"
+CHAT_IMAGES_DIR = CONFIG_DIR / "chat_images"
 
 LOCAL_MODEL_SIZES = ["tiny", "base", "small", "medium", "large-v3-turbo"]
 
@@ -21,10 +22,18 @@ DEFAULTS = {
     "local_model_size": "small",
     "debug_save_audio": False,
     "noise_reduction_strength": 0.7,  # 0.0-1.0
+    "vad_enabled": True,  # skip recordings that contain no detected speech
+    "live_engine": "local",  # "cloud" or "local" — independent of the batch engine
+    "live_model": "",  # cloud model id used only for live dictation
+    "live_local_model_size": "tiny",  # local model size used only for live dictation
     "input_device": None,  # sounddevice input device index, None = system default
     "recording_window_style": "classic",  # "classic", "mini" or "none"
     "recording_window_always_show": False,
     "recording_window_dock": "bottom-2",  # "<edge>-<slot>", see DOCK_EDGES
+    "chat_model": "",  # OpenRouter model id used by the mini chat window
+    "chat_bubble_visible": True,
+    "chat_bubble_dock": "right-2",  # "<edge>-<slot>", see DOCK_EDGES — own key
+                                     # so it doesn't fight the recording overlay
 }
 
 
